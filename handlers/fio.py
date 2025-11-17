@@ -20,7 +20,7 @@ async def process_fio(message: Message, state: FSMContext):
     fio = message.text.strip()
     
     if len(fio) < 3:
-        await message.answer("ФИО слишком короткое. Пожалуйста, введите полное ФИО.")
+        await message.answer("✍️ ФИО слишком короткое. Пожалуйста, введите полное ФИО.")
         return
     
     await state.update_data(fio=fio)
@@ -36,7 +36,7 @@ async def process_fio(message: Message, state: FSMContext):
     ])
     
     await message.answer(
-        f"Ваше ФИО: {fio}\n\nПодтвердите или введите заново.",
+        f"📝 Ваше ФИО: {fio}\n\nПодтвердите или введите заново.",
         reply_markup=keyboard
     )
 
@@ -47,7 +47,7 @@ async def confirm_fio(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     fio = data.get("fio")
     
-    await callback.message.edit_text(f"ФИО подтверждено: {fio}\n\nНачинаем подготовку теста...")
+    await callback.message.edit_text(f"✅ ФИО подтверждено: {fio}\n\nНачинаем подготовку теста...")
     await state.set_state(TestStates.PREPARE_TEST)
     await callback.answer()
     
@@ -60,6 +60,6 @@ async def confirm_fio(callback: CallbackQuery, state: FSMContext):
 async def retry_fio(callback: CallbackQuery, state: FSMContext):
     """Повторный ввод ФИО."""
     await state.set_state(TestStates.COLLECT_FIO)
-    await callback.message.edit_text("Пожалуйста, введите ваше ФИО заново.")
+    await callback.message.edit_text("🔄 Пожалуйста, введите ваше ФИО заново.")
     await callback.answer()
 

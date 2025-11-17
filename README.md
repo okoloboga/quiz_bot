@@ -45,7 +45,7 @@ Columns:
 - Answer 3
 - Answer 4
 - Correct Answer (1-4)
-- The number of valid questions in this sheet must be at least equal to the "Number of questions" value from the ⚙️Настройки sheet. Otherwise, the bot will respond: "В боте недостаточно вопросов. обратитесь к администратору" (Not enough questions in the bot. Contact the administrator).
+- The number of valid questions in this sheet must be at least equal to the "Number of questions" value from the ⚙️Настройки sheet. Otherwise, the bot will respond: "⚠️ В боте недостаточно вопросов. Обратитесь к администратору." (Not enough questions in the bot. Contact the administrator).
 
 ### Sheet ⚙️Настройки
 Columns (headers in the first row, values in the second):
@@ -53,7 +53,7 @@ Columns (headers in the first row, values in the second):
 - Number of allowed errors
 - How often the test can be taken (hours)
 - Number of seconds per question
-- All four fields are required. If at least one of them is empty, the bot will respond: "У бота отсутствуют необходимые настройки. обратитесь к администратору" (The bot is missing necessary settings. Contact the administrator).
+- All four fields are required. If at least one of them is empty, the bot will respond: "⚠️ У бота отсутствуют необходимые настройки. Обратитесь к администратору." (The bot is missing necessary settings. Contact the administrator).
 
 ### Sheet 📊Результаты
 Columns (filled automatically):

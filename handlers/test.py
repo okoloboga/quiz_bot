@@ -33,7 +33,7 @@ async def prepare_test(message: Message, state: FSMContext):
     
     # Проверяем активную сессию
     if await redis_service.has_active_session(telegram_id):
-        await message.answer("У вас уже есть активная сессия теста. Пожалуйста, завершите текущий тест.")
+        await message.answer("⚠️ У вас уже есть активная сессия теста. Пожалуйста, завершите текущий тест.")
         return
     
     try:
@@ -48,7 +48,7 @@ async def prepare_test(message: Message, state: FSMContext):
                 remaining_hours = admin_config.retry_hours - hours_passed
                 remaining_minutes = int((remaining_hours - int(remaining_hours)) * 60)
                 await message.answer(
-                    f"Вы недавно проходили тест. Следующая попытка доступна через "
+                    f"⏳ Вы недавно проходили тест. Следующая попытка доступна через "
                     f"{int(remaining_hours)} ч. {remaining_minutes} мин."
                 )
                 await state.clear()
@@ -68,7 +68,7 @@ async def prepare_test(message: Message, state: FSMContext):
                 actual_num,
                 admin_config.num_questions,
             )
-            await message.answer("В боте недостаточно вопросов. обратитесь к администратору")
+            await message.answer("⚠️ В боте недостаточно вопросов. Обратитесь к администратору.")
             await state.clear()
             return
         
@@ -110,7 +110,7 @@ async def prepare_test(message: Message, state: FSMContext):
         
         # Отправляем приветственное сообщение с правилами
         await message.answer(
-            f"Тест начинается!\n\n"
+            f"🚀 Тест начинается!\n\n"
             f"Правила:\n"
             f"• Количество вопросов: {actual_num}\n"
             f"• Время на вопрос: {admin_config.seconds_per_question} секунд\n"
@@ -123,7 +123,7 @@ async def prepare_test(message: Message, state: FSMContext):
         
     except Exception as e:
         logger.error(f"Ошибка подготовки теста: {e}", exc_info=True)
-        await message.answer("Произошла ошибка при подготовке теста. Попробуйте позже.")
+        await message.answer("❌ Произошла ошибка при подготовке теста. Попробуйте позже.")
         await state.clear()
 
 
@@ -134,7 +134,7 @@ async def ask_next_question(message: Message, state: FSMContext):
     session_dict = data.get("session", {})
     
     if not questions_data or not session_dict:
-        await message.answer("Ошибка: данные сессии не найдены.")
+        await message.answer("⚠️ Ошибка: данные сессии не найдены.")
         await state.clear()
         return
     
@@ -184,7 +184,7 @@ async def ask_next_question(message: Message, state: FSMContext):
     total = len(questions_data)
     
     await message.answer(
-        f"Вопрос {question_num}/{total}\n\n"
+        f"❓ Вопрос {question_num}/{total}\n\n"
         f"{question.question_text}",
         reply_markup=keyboard
     )
@@ -221,7 +221,7 @@ async def check_timeout(message: Message, state: FSMContext, question_index: int
             session = Session.from_dict(session_dict)
             if session.current_index == question_index:
                 # Все еще на этом вопросе - таймаут
-                await message.answer("Время на ответ истекло. Тест завершен.")
+                await message.answer("⏰ Время на ответ истекло. Тест завершен.")
                 await finish_test(message, state, passed=False, timeout_question=question_index + 1)
 
 
@@ -234,7 +234,7 @@ async def process_answer(callback: CallbackQuery, callback_data: AnswerCallback,
     session_dict = data.get("session", {})
     
     if not questions_data or not session_dict:
-        await callback.answer("Ошибка: данные сессии не найдены.")
+        await callback.answer("⚠️ Ошибка: данные сессии не найдены.")
         return
     
     session = Session.from_dict(session_dict)
@@ -242,12 +242,12 @@ async def process_answer(callback: CallbackQuery, callback_data: AnswerCallback,
     
     # Проверяем, что ответ на текущий вопрос
     if callback_data.question_index != current_idx:
-        await callback.answer("Этот вопрос уже пройден.", show_alert=True)
+        await callback.answer("ℹ️ Этот вопрос уже пройден.", show_alert=True)
         return
     
     # Проверяем таймаут
     if session.per_question_deadline and time.time() > session.per_question_deadline:
-        await callback.answer("Время на ответ истекло. Тест завершен.", show_alert=True)
+        await callback.answer("⏰ Время на ответ истекло. Тест завершен.", show_alert=True)
         await finish_test(callback.message, state, passed=False, timeout_question=current_idx + 1)
         return
     
@@ -279,9 +279,9 @@ async def process_answer(callback: CallbackQuery, callback_data: AnswerCallback,
     # Проверяем, не закончились ли баллы
     if session.remaining_score <= 0:
         await callback.message.edit_text(
-            f"Вопрос {question_num}/{total}\n\n"
+            f"❓ Вопрос {question_num}/{total}\n\n"
             f"{question.question_text}\n\n"
-            f"Баллы исчерпаны. Тест завершен."
+            f"❌ Баллы исчерпаны. Тест завершен."
         )
         await finish_test(callback.message, state, passed=False)
         return
@@ -320,7 +320,7 @@ async def finish_test(message: Message, state: FSMContext, passed: bool, timeout
     questions_data = data.get("questions", [])
     
     if not session_dict:
-        await message.answer("Ошибка: данные сессии не найдены.")
+        await message.answer("⚠️ Ошибка: данные сессии не найдены.")
         await state.clear()
         return
     
@@ -358,7 +358,7 @@ async def finish_test(message: Message, state: FSMContext, passed: bool, timeout
     except Exception as e:
         logger.error(f"Ошибка записи результата в Google Sheets: {e}")
         await message.answer(
-            "Результат не удалось сохранить в базу данных. "
+            "⚠️ Результат не удалось сохранить в базу данных. "
             "Пожалуйста, обратитесь к администратору."
         )
     
@@ -372,7 +372,7 @@ async def finish_test(message: Message, state: FSMContext, passed: bool, timeout
     
     # Сообщаем пользователю
     await message.answer(
-        f"Тест завершен.\n\n"
+        f"🏁 Тест завершен.\n\n"
         f"Результат: {result_text}\n"
         f"Правильных ответов: {session.correct_count} из {len(questions_data)}"
     )
