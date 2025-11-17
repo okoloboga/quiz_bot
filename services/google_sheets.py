@@ -158,12 +158,36 @@ class GoogleSheetsService:
                     continue
                 
                 try:
-                    category = row[header_map.get('category', 0)] if header_map.get('category') is not None else ''
-                    question_text = row[header_map.get('question', 1)] if header_map.get('question') is not None else ''
-                    answer1 = row[header_map.get('answer1', 2)] if header_map.get('answer1') is not None else ''
-                    answer2 = row[header_map.get('answer2', 3)] if header_map.get('answer2') is not None else ''
-                    answer3 = row[header_map.get('answer3', 4)] if header_map.get('answer3') is not None else ''
-                    answer4 = row[header_map.get('answer4', 5)] if header_map.get('answer4') is not None else ''
+                    def get_value(key, default_index):
+                        idx = header_map.get(key)
+                        if idx is None:
+                            idx = default_index
+                        if idx is None or idx >= len(row):
+                            return ''
+                        return row[idx].strip()
+
+                    category = get_value('category', 0)
+                    question_text = get_value('question', 1)
+                    if not category or not question_text:
+                        logger.warning(f"Строка {row_idx}: категория или текст вопроса пустые")
+                        continue
+                    def get_answer(key, default_index):
+                        idx = header_map.get(key)
+                        if idx is None:
+                            idx = default_index
+                        if idx is None or idx >= len(row):
+                            return ''
+                        return row[idx].strip()
+                    
+                    answer1 = get_answer('answer1', 2)
+                    answer2 = get_answer('answer2', 3)
+                    answer3 = get_answer('answer3', 4)
+                    answer4 = get_answer('answer4', 5)
+                    answer_list = [answer1, answer2, answer3, answer4]
+                    non_empty_answers = [ans for ans in answer_list if ans]
+                    if len(non_empty_answers) < 2:
+                        logger.warning(f"Строка {row_idx}: недостаточно вариантов ответов (минимум 2)")
+                        continue
                     
                     correct_str = row[header_map.get('correct', 6)] if header_map.get('correct') is not None else ''
                     try:
@@ -175,9 +199,11 @@ class GoogleSheetsService:
                         logger.warning(f"Строка {row_idx}: Неверный формат правильного ответа: {correct_str}")
                         continue
                     
-                    # Проверяем, что все поля заполнены
-                    if not all([category, question_text, answer1, answer2, answer3, answer4]):
-                        logger.warning(f"Строка {row_idx}: Пропущены обязательные поля")
+                    if correct_answer > len(answer_list) or correct_answer < 1:
+                        logger.warning(f"Строка {row_idx}: индекс правильного ответа вне диапазона: {correct_answer}")
+                        continue
+                    if not answer_list[correct_answer - 1]:
+                        logger.warning(f"Строка {row_idx}: правильный ответ указывает на пустой вариант")
                         continue
                     
                     question = Question(

@@ -165,20 +165,28 @@ async def ask_next_question(message: Message, state: FSMContext):
     # Формируем клавиатуру с вариантами ответов
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
     
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text=question.answer1, callback_data=AnswerCallback(question_index=current_idx, answer=1).pack())
-        ],
-        [
-            InlineKeyboardButton(text=question.answer2, callback_data=AnswerCallback(question_index=current_idx, answer=2).pack())
-        ],
-        [
-            InlineKeyboardButton(text=question.answer3, callback_data=AnswerCallback(question_index=current_idx, answer=3).pack())
-        ],
-        [
-            InlineKeyboardButton(text=question.answer4, callback_data=AnswerCallback(question_index=current_idx, answer=4).pack())
-        ]
-    ])
+    answer_buttons = []
+    answer_options = [
+        (question.answer1, 1),
+        (question.answer2, 2),
+        (question.answer3, 3),
+        (question.answer4, 4),
+    ]
+    for text, num in answer_options:
+        if text:
+            answer_buttons.append([
+                InlineKeyboardButton(
+                    text=text,
+                    callback_data=AnswerCallback(question_index=current_idx, answer=num).pack()
+                )
+            ])
+    if len(answer_buttons) < 2:
+        logger.error(f"Вопрос {question.row_index} содержит недостаточно вариантов ответов.")
+        await message.answer("⚠️ Ошибка: недостаточно вариантов ответов для этого вопроса. Обратитесь к администратору.")
+        await state.clear()
+        return
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=answer_buttons)
     
     question_num = current_idx + 1
     total = len(questions_data)
