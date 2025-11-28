@@ -178,12 +178,12 @@ async def ask_next_question(message: Message, state: FSMContext):
     for text, num in answer_options:
         if text:
             answers_text += f"{num}. {text}\n"
-            answer_buttons.append([
+            answer_buttons.append(
                 InlineKeyboardButton(
                     text=str(num),
                     callback_data=AnswerCallback(question_index=current_idx, answer=num).pack()
                 )
-            ])
+            )
 
     if len(answer_buttons) < 2:
         logger.error(f"Вопрос {question.row_index} содержит недостаточно вариантов ответов.")
@@ -191,7 +191,7 @@ async def ask_next_question(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=answer_buttons)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[answer_buttons])
 
     question_num = current_idx + 1
     total = len(questions_data)
