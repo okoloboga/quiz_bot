@@ -1,4 +1,7 @@
 import logging
+import time
+from datetime import timedelta
+
 from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.types import Message
@@ -41,6 +44,30 @@ async def cmd_start(message: Message, state: FSMContext):
         await message.answer("⚠️ У бота отсутствуют необходимые настройки. Обратитесь к администратору.")
         await state.clear()
         return
+
+    # Проверка на cooldown
+    last_test_time = sheets_service.get_last_test_time(message.from_user.id)
+    if last_test_time:
+        cooldown_seconds = admin_config.retry_hours * 3600
+        time_passed = time.time() - last_test_time
+        
+        if time_passed < cooldown_seconds:
+            remaining_time = cooldown_seconds - time_passed
+            # Форматируем оставшееся время в ЧЧ:ММ:СС
+            td = timedelta(seconds=int(remaining_time))
+            hours, remainder = divmod(td.seconds, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            remaining_str = f"{hours:02}:{minutes:02}:{seconds:02}"
+            
+            logger.info(
+                f"Пользователь {message.from_user.id} попытался пройти тест раньше времени. "
+                f"Осталось: {remaining_str}"
+            )
+            await message.answer(
+                f"Вы уже проходили тест. Следующая попытка будет доступна через: {remaining_str}"
+            )
+            await state.clear()
+            return
     
     # Проверяем количество вопросов
     all_questions = sheets_service.read_questions()
@@ -74,4 +101,3 @@ async def cmd_start(message: Message, state: FSMContext):
         "👋 Добро пожаловать! Для начала теста введите ваше ФИО (Фамилия Имя Отчество) одной строкой."
     )
     logger.info(f"Пользователь {message.from_user.id} начал сессию")
-

@@ -229,61 +229,57 @@ class GoogleSheetsService:
     def get_last_test_time(self, telegram_id: int) -> Optional[float]:
         """Возвращает timestamp последнего прохождения теста для пользователя."""
         try:
-            range_name = f'{RESULTS_SHEET}!A:A'  # Колонка telegram_id
+            # Читаем колонки A (ID) и C (Дата)
+            range_name = f'{RESULTS_SHEET}!A:C'
             result = self._retry_request(
                 self.service.spreadsheets().values().get,
                 spreadsheetId=self.sheet_id,
                 range=range_name
             )
             values = result.get('values', [])
-            
-            if len(values) < 2:  # Только заголовок
+
+            if len(values) < 2:  # Нет данных кроме заголовка
                 return None
-            
-            # Ищем последнюю запись для этого telegram_id
+
+            # Ищем последнюю запись для этого telegram_id, идя с конца
             telegram_id_str = str(telegram_id)
-            last_row = None
+            for row in reversed(values[1:]):  # Пропускаем заголовок
+                if not row:
+                    continue
+                
+                # Убедимся, что в строке есть и ID, и дата
+                if str(row[0]) == telegram_id_str:
+                    if len(row) > 2 and row[2]:
+                        date_str = row[2]
+                        from datetime import datetime
+                        import pytz
+
+                        try:
+                            # Новый формат: 2025-11-28T12:35:01.837738+03:00
+                            dt = datetime.fromisoformat(date_str)
+                            return dt.timestamp()
+                        except ValueError:
+                            # Обработка других форматов
+                            try:
+                                # Формат с секундами, но без таймзоны
+                                dt_naive = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+                            except ValueError:
+                                try:
+                                    # Формат без секунд и без таймзоны
+                                    dt_naive = datetime.strptime(date_str, "%Y-%m-%d %H:%M")
+                                except ValueError:
+                                    logger.warning(f"Не удалось распознать формат даты '{date_str}' для пользователя {telegram_id}")
+                                    continue # Ищем дальше, вдруг есть более ранняя запись в правильном формате
+
+                            # Локализуем старые даты в Московской таймзоне
+                            tz = pytz.timezone("Europe/Moscow")
+                            dt_aware = tz.localize(dt_naive)
+                            return dt_aware.timestamp()
+                    else:
+                        # Нашли пользователя, но дата пустая, ищем дальше
+                        continue
             
-            for i in range(len(values) - 1, 0, -1):  # Идем с конца
-                if i < len(values) and len(values[i]) > 0:
-                    if str(values[i][0]) == telegram_id_str:
-                        last_row = i + 1  # +1 потому что строки в Sheets начинаются с 1
-                        break
-            
-            if last_row is None:
-                return None
-            
-            # Читаем дату из колонки "Дата прохождения теста" (колонка C, индекс 2)
-            date_range = f'{RESULTS_SHEET}!C{last_row}'
-            date_result = self._retry_request(
-                self.service.spreadsheets().values().get,
-                spreadsheetId=self.sheet_id,
-                range=date_range
-            )
-            date_values = date_result.get('values', [])
-            
-            if not date_values or not date_values[0]:
-                return None
-            
-            # Парсим дату
-            from datetime import datetime
-            try:
-                date_str = date_values[0][0]
-                # Пробуем парсить как ISO 8601
-                try:
-                    dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-                    return dt.timestamp()
-                except ValueError:
-                    # Пробуем парсить старый формат
-                    dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M")
-                    # Предполагаем, что старые даты были в том же часовом поясе
-                    import pytz
-                    tz = pytz.timezone("Europe/Moscow")
-                    dt = tz.localize(dt)
-                    return dt.timestamp()
-            except Exception as e:
-                logger.warning(f"Ошибка парсинга даты '{date_values[0][0]}': {e}")
-                return None
+            return None  # Не найдено записей для пользователя
         except Exception as e:
             logger.error(f"Ошибка получения времени последнего теста: {e}")
             return None

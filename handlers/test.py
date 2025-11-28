@@ -346,7 +346,7 @@ async def finish_test(message: Message, state: FSMContext, passed: bool, timeout
     try:
         tz = pytz.timezone("Europe/Moscow")  # UTC+3
         now = datetime.now(tz)
-        test_date = now.isoformat()
+        test_date = now.strftime("%Y-%m-%d %H:%M")
         
         if user_data.get("username"):
             display_name = user_data["username"]
