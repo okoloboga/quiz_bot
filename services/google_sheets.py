@@ -265,14 +265,24 @@ class GoogleSheetsService:
             if not date_values or not date_values[0]:
                 return None
             
-            # Парсим ISO дату
+            # Парсим дату
             from datetime import datetime
             try:
                 date_str = date_values[0][0]
-                dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-                return dt.timestamp()
+                # Пробуем парсить как ISO 8601
+                try:
+                    dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+                    return dt.timestamp()
+                except ValueError:
+                    # Пробуем парсить старый формат
+                    dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M")
+                    # Предполагаем, что старые даты были в том же часовом поясе
+                    import pytz
+                    tz = pytz.timezone("Europe/Moscow")
+                    dt = tz.localize(dt)
+                    return dt.timestamp()
             except Exception as e:
-                logger.warning(f"Ошибка парсинга даты: {e}")
+                logger.warning(f"Ошибка парсинга даты '{date_values[0][0]}': {e}")
                 return None
         except Exception as e:
             logger.error(f"Ошибка получения времени последнего теста: {e}")
