@@ -24,6 +24,7 @@ class TestStates(StatesGroup):
     ASKING = State()
     WAIT_ANSWER = State()
     FINISHED = State()
+    WAIT_FINAL_NOTE = State()
 
 
 @router.message(Command("start"))

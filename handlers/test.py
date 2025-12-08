@@ -314,14 +314,12 @@ async def process_answer(callback: CallbackQuery, callback_data: AnswerCallback,
     await ask_next_question(callback.message, state)
 
 
-async def finish_test(message: Message, state: FSMContext, passed: bool, timeout_question: Optional[int] = None):
-    """Завершает тест и сохраняет результат."""
-    # Получаем данные пользователя из state (сохраняем при старте)
+async def _save_result_and_notify_user(message: Message, state: FSMContext, passed: bool, notes: Optional[str] = None, timeout_question: Optional[int] = None):
+    """Завершает тест, сохраняет результат и уведомляет пользователя."""
     data = await state.get_data()
     user_data = data.get("user_data")
     
     if not user_data:
-        # Fallback на message.from_user, если не сохранено в state
         user_data = {
             "id": message.from_user.id,
             "username": message.from_user.username,
@@ -337,28 +335,21 @@ async def finish_test(message: Message, state: FSMContext, passed: bool, timeout
         await message.answer("⚠️ Ошибка: данные сессии не найдены.")
         await state.clear()
         return
-    
+
     session = Session.from_dict(session_dict)
-    
-    # Определяем результат
     result_text = "Пройден" if passed else "Не пройден"
     
-    # Формируем примечания
-    notes = None
+    final_notes = notes
     if timeout_question:
-        notes = f"таймаут на вопрос #{timeout_question}"
-    
-    # Сохраняем в Google Sheets
+        timeout_note = f"таймаут на вопрос #{timeout_question}"
+        final_notes = f"{timeout_note}; {notes}" if notes else timeout_note
+
     try:
-        tz = pytz.timezone("Europe/Moscow")  # UTC+3
+        tz = pytz.timezone("Europe/Moscow")
         now = datetime.now(tz)
         test_date = now.strftime("%Y-%m-%d %H:%M")
         
-        if user_data.get("username"):
-            display_name = user_data["username"]
-        else:
-            parts = [user_data.get("first_name") or '', user_data.get("last_name") or '']
-            display_name = " ".join(part for part in parts if part).strip()
+        display_name = user_data.get("username") or " ".join(filter(None, [user_data.get("first_name"), user_data.get("last_name")])).strip()
 
         sheets_service.write_result(
             telegram_id=telegram_id,
@@ -367,45 +358,62 @@ async def finish_test(message: Message, state: FSMContext, passed: bool, timeout
             fio=session.fio,
             result=result_text,
             correct_count=session.correct_count,
-            notes=notes
+            notes=final_notes
         )
     except Exception as e:
         logger.error(f"Ошибка записи результата в Google Sheets: {e}")
-        await message.answer(
-            "⚠️ Результат не удалось сохранить в базу данных. "
-            "Пожалуйста, обратитесь к администратору."
-        )
+        await message.answer("⚠️ Результат не удалось сохранить. Обратитесь к администратору.")
     
-    # Логируем результат
     logger.info(
-        f"Тест завершен для пользователя {telegram_id}: "
-        f"FIO={session.fio}, result={result_text}, "
-        f"correct_count={session.correct_count}/{len(questions_data)}, "
-        f"remaining_score={session.remaining_score}"
+        f"Тест завершен для {telegram_id}: FIO={session.fio}, result={result_text}, correct={session.correct_count}/{len(questions_data)}"
     )
     
-    # Сообщаем пользователю
     if passed:
         await message.answer(
             "✅ Тест успешно пройден!\n\n"
-            "Отличный результат.\n"
-            "Вы подтвердили знание ключевых правил компании.\n\n"
-            "🔧 Соблюдение этих норм снижает аварийность, бережёт технику, повышает эффективность и напрямую влияет на вашу заработную плату.\n\n"
-            "🔁 Следующее тестирование будет доступно в плановом порядке. Продолжайте поддерживать знания на высоком уровне.\n\n"
-            "Спасибо за ответственное отношение к работе."
+            "Спасибо за обратную связь и ответственное отношение к работе."
         )
     else:
         await message.answer(
-            "❌ Тест не пройден\n\n"
-            "По результатам тестирования выявлены ошибки в базовых правилах, которые должны быть доведены до автоматизма.\n\n"
-            "📚 Необходимо повторить материалы.\n"
-            "⏳ Повторная попытка станет доступна через 24 часа.\n\n"
-            "⚠️ Напоминаем, что знание регламентов — обязательное условие безопасной и эффективной работы, влияющее на вашу заработную плату, сохранность техники и безопасность окружающих.\n\n"
-            "Будьте внимательны. Следующая попытка — завтра."
+            "❌ Тест не пройден.\n\n"
+            "📚 Необходимо повторить материалы. Повторная попытка станет доступна через 24 часа.\n\n"
+            "Спасибо за обратную связь."
         )
     
-    # Удаляем сессию
     await redis_service.delete_session(telegram_id)
-    await state.set_state(TestStates.FINISHED)
     await state.clear()
+
+
+async def finish_test(message: Message, state: FSMContext, passed: bool, timeout_question: Optional[int] = None):
+    """Завершает основную часть теста и запрашивает финальный комментарий."""
+    await state.update_data(test_passed=passed, timeout_question=timeout_question)
+    
+    final_question_text = (
+        "❓ Какой один конкретный процесс в работе автоколонны, по вашему мнению, требует улучшения в первую очередь — "
+        "и что именно в нём нужно изменить, чтобы улучшить работу? Ваш ответ будет передан руководству ГК «Лагранж»"
+    )
+    
+    await message.answer(final_question_text)
+    await state.set_state(TestStates.WAIT_FINAL_NOTE)
+
+
+@router.message(TestStates.WAIT_FINAL_NOTE, F.text)
+async def process_final_note(message: Message, state: FSMContext):
+    """Обрабатывает финальный комментарий и завершает тест."""
+    note = message.text
+    if len(note) > 1024:
+        await message.answer("Слишком длинный ответ. Пожалуйста, сократите его до 1024 символов.")
+        return
+        
+    data = await state.get_data()
+    passed = data.get("test_passed", False)
+    timeout_question = data.get("timeout_question")
+    
+    await _save_result_and_notify_user(message, state, passed=passed, notes=note, timeout_question=timeout_question)
+
+
+@router.message(TestStates.WAIT_FINAL_NOTE)
+async def process_final_note_invalid(message: Message, state: FSMContext):
+    """Обрабатывает нетекстовый ввод для финального комментария."""
+    await message.answer("Пожалуйста, введите ваш комментарий в виде текста.")
 
