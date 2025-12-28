@@ -4,8 +4,11 @@ import sys
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.redis import RedisStorage
 from config import Config
-from handlers import common, fio, test
+from handlers import common, fio, test # Оставим пока, потом уберем fio и test, если они будут заменены новыми
+from handlers import registration_handlers # Импортируем новый роутер
+from middlewares.access_middleware import AccessMiddleware # Импортируем middleware
 from services.redis_service import RedisService
+from services.google_sheets import GoogleSheetsService # Импортируем GoogleSheetsService
 
 # Настройка логирования
 logging.basicConfig(
@@ -17,6 +20,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 redis_service = RedisService()
+google_sheets_service = GoogleSheetsService() # Создаем экземпляр GoogleSheetsService
 
 
 async def main():
@@ -50,11 +54,21 @@ async def main():
     
     dp = Dispatcher(storage=storage)
     
-    # Регистрация роутеров
+    # Регистрация middleware
+    dp.message.middleware(AccessMiddleware())
+    dp.callback_query.middleware(AccessMiddleware()) # Также применяем к callback_query
+
+    # Регистрация роутеров. Важен порядок: registration_handlers должен идти раньше, чтобы перехватить /start
+    dp.include_router(registration_handlers.router)
     dp.include_router(common.router)
     dp.include_router(fio.router)
     dp.include_router(test.router)
-    
+
+    # Передача зависимостей
+    dp["google_sheets"] = google_sheets_service
+    dp["redis_service"] = redis_service # redis_service уже глобально, но для единообразия
+
+
     logger.info("Бот запущен")
     
     try:

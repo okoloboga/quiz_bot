@@ -15,9 +15,10 @@ class AdminConfigError(Exception):
     """Ошибка, возникающая при отсутствии или некорректных настройках в листе ⚙️Настройки."""
 
 
-QUESTIONS_SHEET = "❓Вопросы"
-ADMIN_SHEET = "⚙️Настройки"
-RESULTS_SHEET = "📊Результаты"
+USERS_SHEET = "Пользователи"
+QUESTIONS_SHEET = "Вопросы"
+ADMIN_SHEET = "Настройки"
+RESULTS_SHEET = "Результаты"
 
 
 class GoogleSheetsService:
@@ -57,8 +58,81 @@ class GoogleSheetsService:
         logger.error(f"Не удалось выполнить запрос после {self.max_retries} попыток")
         raise last_error
 
+    def add_user(self, telegram_id: str, phone_number: str, fio: str, motorcade: str, status: str = "ожидает"):
+        """Добавляет нового пользователя в лист 'Пользователи'."""
+        try:
+            values = [[
+                telegram_id,
+                phone_number,
+                fio,
+                motorcade,
+                status
+            ]]
+            
+            body = {
+                'values': values
+            }
+            
+            self._retry_request(
+                self.service.spreadsheets().values().append,
+                spreadsheetId=self.sheet_id,
+                range=f'{USERS_SHEET}!A:E', # A:E для telegram_id, phone_number, fio, motorcade, status
+                valueInputOption='RAW',
+                insertDataOption='INSERT_ROWS',
+                body=body
+            )
+            logger.info(f"Пользователь {telegram_id} добавлен в лист '{USERS_SHEET}' со статусом '{status}'")
+        except Exception as e:
+            logger.error(f"Ошибка добавления пользователя в лист '{USERS_SHEET}': {e}")
+            raise
+    
+    def get_user_status(self, telegram_id: str) -> Optional[str]:
+        """Получает статус пользователя из листа 'Пользователи'."""
+        try:
+            # Читаем все данные из листа "Пользователи"
+            range_name = f'{USERS_SHEET}!A:E'
+            result = self._retry_request(
+                self.service.spreadsheets().values().get,
+                spreadsheetId=self.sheet_id,
+                range=range_name
+            )
+            values = result.get('values', [])
+
+            if not values:
+                return None
+            
+            # Предполагаем, что первая строка - заголовки
+            headers = values[0]
+            
+            # Находим индексы нужных колонок
+            telegram_id_col = -1
+            status_col = -1
+            
+            for i, header in enumerate(headers):
+                if header.lower() == 'telegram_id':
+                    telegram_id_col = i
+                elif header.lower() == 'статус':
+                    status_col = i
+            
+            if telegram_id_col == -1 or status_col == -1:
+                logger.warning(f"В листе '{USERS_SHEET}' не найдены колонки 'telegram_id' или 'статус'")
+                return None
+
+            # Ищем пользователя по telegram_id
+            for row in values[1:]: # Пропускаем заголовки
+                if len(row) > telegram_id_col and str(row[telegram_id_col]) == telegram_id:
+                    if len(row) > status_col:
+                        return row[status_col]
+                    break # Нашли пользователя, но нет статуса
+            
+            return None # Пользователь не найден
+        except Exception as e:
+            logger.error(f"Ошибка получения статуса пользователя {telegram_id} из листа '{USERS_SHEET}': {e}")
+            return None
+
+
     def read_admin_config(self) -> AdminConfig:
-        """Читает конфигурацию из листа ⚙️Настройки."""
+        """Читает конфигурацию из листа Настройки."""
         try:
             range_name = f'{ADMIN_SHEET}!A1:D2'  # Заголовки в A1-D1, значения в A2-D2
             result = self._retry_request(
@@ -69,7 +143,7 @@ class GoogleSheetsService:
             values = result.get('values', [])
             
             if len(values) < 2:
-                raise AdminConfigError("Лист ⚙️Настройки должен содержать заголовки и значения")
+                raise AdminConfigError("Лист Настройки должен содержать заголовки и значения")
             
             # Ищем значения по заголовкам
             headers = values[0] if len(values) > 0 else []
@@ -113,11 +187,11 @@ class GoogleSheetsService:
         except AdminConfigError:
             raise
         except Exception as e:
-            logger.error(f"Ошибка чтения конфигурации (⚙️Настройки): {e}")
+            logger.error(f"Ошибка чтения конфигурации (Настройки): {e}")
             raise
 
     def read_questions(self) -> List[Question]:
-        """Читает все вопросы из листа ❓Вопросы."""
+        """Читает все вопросы из листа Вопросы."""
         try:
             range_name = f'{QUESTIONS_SHEET}!A:H'  # Категория, Вопрос, Ответ 1-4, Правильный ответ, ID
             result = self._retry_request(
@@ -294,7 +368,7 @@ class GoogleSheetsService:
         correct_count: int,
         notes: Optional[str] = None
     ):
-        """Записывает результат теста в лист 📊Результаты."""
+        """Записывает результат теста в лист Результаты."""
         try:
             values = [[
                 str(telegram_id),

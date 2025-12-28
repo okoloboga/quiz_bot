@@ -12,6 +12,10 @@ class Config:
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
     SESSION_TTL_PADDING = int(os.getenv("SESSION_TTL_PADDING", "300"))
 
+    # New IDs for owner and admin
+    OWNER_TELEGRAM_ID = os.getenv("OWNER_TELEGRAM_ID")
+    ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID")
+
     # Google Sheets credentials
     _credentials_value = os.getenv("GOOGLE_CREDENTIALS")
     if _credentials_value:
