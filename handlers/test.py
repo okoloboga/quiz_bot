@@ -3,19 +3,21 @@ import logging
 import time
 from datetime import datetime
 from typing import Optional
+
 import pytz
-from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery
-from aiogram.fsm.context import FSMContext
+from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters.callback_data import CallbackData
+from aiogram.fsm.context import FSMContext
+from aiogram.types import CallbackQuery, Message
+
 from handlers.common import TestStates
-from services.google_sheets import GoogleSheetsService, AdminConfigError
+from models import CampaignType, Question, Session
+from services.google_sheets import GoogleSheetsService
 from services.redis_service import RedisService
-from models import Session, AdminConfig
 from utils.question_distribution import distribute_questions_by_category
 
 logger = logging.getLogger(__name__)
-
 router = Router()
 
 sheets_service = GoogleSheetsService()
@@ -24,103 +26,65 @@ redis_service = RedisService()
 
 class AnswerCallback(CallbackData, prefix="answer"):
     question_index: int
-    answer: int  # 1-4
+    answer: int
 
 
 async def prepare_test(message: Message, state: FSMContext):
-    """Подготавливает тест: проверяет повторные прохождения, формирует вопросы."""
     telegram_id = message.from_user.id
-    
-    # Проверяем активную сессию
     if await redis_service.has_active_session(telegram_id):
-        await message.answer("⚠️ У вас уже есть активная сессия теста. Пожалуйста, завершите текущий тест.")
+        await message.answer("⚠️ У вас уже есть активная сессия теста. Пожалуйста, завершите ее.")
         return
-    
+
     try:
-        # Читаем конфигурацию (проверки уже были в /start)
         admin_config = sheets_service.read_admin_config()
-        
-        # Проверяем время последнего прохождения
-        last_test_time = sheets_service.get_last_test_time(telegram_id)
-        if last_test_time:
-            hours_passed = (time.time() - last_test_time) / 3600
-            if hours_passed < admin_config.retry_hours:
-                remaining_hours = admin_config.retry_hours - hours_passed
-                remaining_minutes = int((remaining_hours - int(remaining_hours)) * 60)
-                await message.answer(
-                    f"⏳ Вы недавно проходили тест. Следующая попытка доступна через "
-                    f"{int(remaining_hours)} ч. {remaining_minutes} мин."
-                )
-                await state.clear()
-                return
-        
-        # Загружаем вопросы (проверка количества уже была в /start)
         all_questions = sheets_service.read_questions()
-        logger.info(f"Загружено {len(all_questions)} вопросов из таблицы")
         
-        # Формируем выборку
-        selected_questions = distribute_questions_by_category(all_questions, admin_config.num_questions)
-        actual_num = len(selected_questions)
-        
-        if actual_num < admin_config.num_questions:
-            logger.error(
-                "Не удалось сформировать достаточно вопросов: получено %s из %s",
-                actual_num,
-                admin_config.num_questions,
-            )
+        if len(all_questions) < admin_config.num_questions:
             await message.answer("⚠️ В боте недостаточно вопросов. Обратитесь к администратору.")
             await state.clear()
             return
-        
-        # Сохраняем данные в state
+
+        selected_questions = distribute_questions_by_category(all_questions, admin_config.num_questions)
+        actual_num = len(selected_questions)
+
+        if actual_num < admin_config.num_questions:
+            await message.answer("⚠️ Не удалось сформировать достаточное количество вопросов. Обратитесь к администратору.")
+            await state.clear()
+            return
+
         data = await state.get_data()
-        fio = data.get("fio")
-        
-        question_ids = [q.row_index for q in selected_questions]
-        
-        # Создаем сессию
         session = Session(
-            fio=fio,
-            question_ids=question_ids,
+            fio=data.get("fio"),
+            question_ids=[q.row_index for q in selected_questions],
             current_index=0,
             remaining_score=admin_config.max_errors,
             correct_count=0,
             started_at=time.time(),
             last_action_at=time.time(),
             per_question_deadline=None,
-            admin_config_snapshot={
-                "num_questions": actual_num,
-                "max_errors": admin_config.max_errors,
-                "retry_hours": admin_config.retry_hours,
-                "seconds_per_question": admin_config.seconds_per_question
-            }
+            admin_config_snapshot=admin_config.__dict__,
+            campaign_name=data.get("campaign_name"),
+            mode=data.get("mode")
         )
-        
-        # Сохраняем вопросы в state для доступа
+
         await state.update_data(
             questions=[q.__dict__ for q in selected_questions],
             session=session.to_dict()
         )
-        
-        # Сохраняем сессию в Redis
-        ttl = actual_num * admin_config.seconds_per_question + 300  # + padding
+
+        ttl = actual_num * admin_config.seconds_per_question + 300
         await redis_service.set_session(telegram_id, session, ttl)
-        
         await state.set_state(TestStates.ASKING)
-        
-        # Отправляем приветственное сообщение с правилами
+
         await message.answer(
             f"🚀 Тест начинается!\n\n"
             f"Правила:\n"
             f"• Количество вопросов: {actual_num}\n"
             f"• Время на вопрос: {admin_config.seconds_per_question} секунд\n"
-            f"• Допустимых ошибок: {admin_config.max_errors}\n\n"
-            f"При достижении 0 баллов тест завершится автоматически."
+            f"• Допустимых ошибок: {admin_config.max_errors}"
         )
-        
-        # Начинаем задавать вопросы
         await ask_next_question(message, state)
-        
+
     except Exception as e:
         logger.error(f"Ошибка подготовки теста: {e}", exc_info=True)
         await message.answer("❌ Произошла ошибка при подготовке теста. Попробуйте позже.")
@@ -128,292 +92,164 @@ async def prepare_test(message: Message, state: FSMContext):
 
 
 async def ask_next_question(message: Message, state: FSMContext):
-    """Задает следующий вопрос."""
     data = await state.get_data()
+    session = Session.from_dict(data.get("session", {}))
     questions_data = data.get("questions", [])
-    session_dict = data.get("session", {})
-    
-    if not questions_data or not session_dict:
+
+    if not session or not questions_data:
         await message.answer("⚠️ Ошибка: данные сессии не найдены.")
         await state.clear()
         return
-    
-    session = Session.from_dict(session_dict)
+
     current_idx = session.current_index
-    
     if current_idx >= len(questions_data):
-        # Все вопросы заданы
         await finish_test(message, state, passed=True)
         return
-    
-    # Получаем текущий вопрос
-    question_data = questions_data[current_idx]
-    from models import Question
-    question = Question(**question_data)
-    
-    # Устанавливаем deadline
+
+    question = Question(**questions_data[current_idx])
     deadline = time.time() + session.admin_config_snapshot["seconds_per_question"]
     session.per_question_deadline = deadline
     session.last_action_at = time.time()
-    
-    # Обновляем state и Redis
+
     await state.update_data(session=session.to_dict())
     telegram_id = message.from_user.id
     ttl = (len(questions_data) - current_idx) * session.admin_config_snapshot["seconds_per_question"] + 300
     await redis_service.set_session(telegram_id, session, ttl)
-    
-    # Формируем клавиатуру с вариантами ответов
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-    answer_buttons = []
-    answer_options = [
-        (question.answer1, 1),
-        (question.answer2, 2),
-        (question.answer3, 3),
-        (question.answer4, 4),
-    ]
-
-    # Собираем текст вариантов ответов и кнопки только с цифрами
     answers_text = ""
-    for text, num in answer_options:
-        if text:
-            answers_text += f"{num}. {text}\n"
-            answer_buttons.append(
-                InlineKeyboardButton(
-                    text=str(num),
-                    callback_data=AnswerCallback(question_index=current_idx, answer=num).pack()
-                )
-            )
+    buttons = []
+    for i, ans in enumerate([question.answer1, question.answer2, question.answer3, question.answer4]):
+        if ans:
+            answers_text += f"{i + 1}. {ans}\n"
+            buttons.append(InlineKeyboardButton(text=str(i + 1),
+                                                callback_data=AnswerCallback(question_index=current_idx,
+                                                                             answer=i + 1).pack()))
 
-    if len(answer_buttons) < 2:
-        logger.error(f"Вопрос {question.row_index} содержит недостаточно вариантов ответов.")
-        await message.answer("⚠️ Ошибка: недостаточно вариантов ответов для этого вопроса. Обратитесь к администратору.")
-        await state.clear()
-        return
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[answer_buttons])
-
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[buttons])
     question_num = current_idx + 1
     total = len(questions_data)
 
     await message.answer(
-        f"❓ Вопрос {question_num}/{total}\n\n"
-        f"{question.question_text}\n\n"
-        f"{answers_text}",
+        f"❓ Вопрос {question_num}/{total}\n\n{question.question_text}\n\n{answers_text}",
         reply_markup=keyboard
     )
-    
     await state.set_state(TestStates.WAIT_ANSWER)
-    
-    logger.info(f"Вопрос {question_num} отправлен пользователю {telegram_id}: category={question.category}, row={question.row_index}")
-    
-    # Запускаем таймер
+    logger.info(f"Вопрос {question_num} отправлен пользователю {telegram_id} (row={question.row_index})")
     asyncio.create_task(check_timeout(message, state, current_idx, deadline))
 
 
-async def check_timeout(message: Message, state: FSMContext, question_index: int, deadline: float):
-    """Проверяет таймаут для вопроса."""
-    sleep_time = deadline - time.time() + 0.5
-    if sleep_time > 0:
-        await asyncio.sleep(sleep_time)
-    
-    # Проверяем, не изменился ли индекс вопроса (пользователь ответил)
+async def check_timeout(message: Message, state: FSMContext, q_index: int, deadline: float):
+    await asyncio.sleep(deadline - time.time() + 0.5)
     data = await state.get_data()
-    session_dict = data.get("session", {})
-    if session_dict:
-        session = Session.from_dict(session_dict)
-        if session.current_index > question_index:
-            # Пользователь уже ответил
-            return
-    
-    # Проверяем deadline
-    if time.time() >= deadline:
-        # Таймаут
-        data = await state.get_data()
-        session_dict = data.get("session", {})
-        if session_dict:
-            session = Session.from_dict(session_dict)
-            if session.current_index == question_index:
-                # Все еще на этом вопросе - таймаут
-                await message.answer("⏰ Время на ответ истекло. Тест завершен.")
-                await finish_test(message, state, passed=False, timeout_question=question_index + 1)
+    session = Session.from_dict(data.get("session", {}))
+
+    if session and session.current_index == q_index and time.time() >= deadline:
+        await message.answer("⏰ Время на ответ истекло. Тест завершен.")
+        await finish_test(message, state, passed=False, notes=f"таймаут на вопрос #{q_index + 1}")
 
 
 @router.callback_query(TestStates.WAIT_ANSWER, AnswerCallback.filter())
-async def process_answer(callback: CallbackQuery, callback_data: AnswerCallback, state: FSMContext):
-    """Обрабатывает ответ пользователя."""
-    telegram_id = callback.from_user.id
+async def process_answer(cb: CallbackQuery, cbd: AnswerCallback, state: FSMContext):
     data = await state.get_data()
+    session = Session.from_dict(data.get("session", {}))
     questions_data = data.get("questions", [])
-    session_dict = data.get("session", {})
     
-    if not questions_data or not session_dict:
-        await callback.answer("⚠️ Ошибка: данные сессии не найдены.")
+    if not session or not questions_data or cbd.question_index != session.current_index:
+        await cb.answer("⚠️ Ошибка сессии или запоздалый ответ.", show_alert=True)
         return
-    
-    session = Session.from_dict(session_dict)
-    current_idx = session.current_index
-    
-    # Проверяем, что ответ на текущий вопрос
-    if callback_data.question_index != current_idx:
-        await callback.answer("ℹ️ Этот вопрос уже пройден.", show_alert=True)
+
+    if time.time() > session.per_question_deadline:
+        await cb.answer("⏰ Время на ответ истекло.", show_alert=True)
+        await finish_test(cb.message, state, passed=False, notes=f"таймаут на вопрос #{session.current_index + 1}")
         return
-    
-    # Проверяем таймаут
-    if session.per_question_deadline and time.time() > session.per_question_deadline:
-        await callback.answer("⏰ Время на ответ истекло. Тест завершен.", show_alert=True)
-        await finish_test(callback.message, state, passed=False, timeout_question=current_idx + 1)
-        return
-    
-    # Получаем вопрос
-    question_data = questions_data[current_idx]
-    from models import Question
-    question = Question(**question_data)
-    
-    # Проверяем ответ
-    is_correct = callback_data.answer == question.correct_answer
-    
+
+    question = Question(**questions_data[session.current_index])
+    is_correct = cbd.answer == question.correct_answer
+
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass # Сообщение не изменилось, это нормально
+
     if is_correct:
         session.correct_count += 1
+        await cb.answer("✅ Верно!", show_alert=False)
     else:
         session.remaining_score -= 1
-    
+        await cb.answer("❌ Неверно!", show_alert=False)
+
+        if question.is_critical:
+            await cb.message.answer("Вы ошиблись в критическом вопросе. Тест завершен.")
+            await finish_test(cb.message, state, passed=False, notes="неверный ответ на критический вопрос")
+            return
+
+        if session.mode == CampaignType.TRAINING and question.explanation:
+            await cb.message.answer(f" пояснение: {question.explanation}")
+
     logger.info(
-        f"Ответ пользователя {telegram_id} на вопрос {current_idx + 1}: "
-        f"выбран={callback_data.answer}, правильный={question.correct_answer}, "
-        f"correct={is_correct}, remaining_score={session.remaining_score}"
+        f"Ответ п-ля {cb.from_user.id} на в. {session.current_index + 1}: "
+        f"выбран={cbd.answer}, прав={question.correct_answer}, "
+        f"итог={is_correct}, баллы={session.remaining_score}"
     )
-    
-    # Просто убираем кнопки из сообщения
-    question_num = current_idx + 1
-    total = len(questions_data)
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.answer()
-    
-    # Проверяем, не закончились ли баллы
+
     if session.remaining_score <= 0:
-        await callback.message.edit_text(
-            f"❓ Вопрос {question_num}/{total}\n\n"
-            f"{question.question_text}\n\n"
-            f"❌ Баллы исчерпаны. Тест завершен."
-        )
-        await finish_test(callback.message, state, passed=False)
+        await cb.message.answer("Баллы исчерпаны. Тест завершен.")
+        await finish_test(cb.message, state, passed=False, notes="закончились баллы")
         return
-    
-    # Переходим к следующему вопросу
+
     session.current_index += 1
-    session.last_action_at = time.time()
-    session.per_question_deadline = None
-    
     await state.update_data(session=session.to_dict())
-    ttl = (len(questions_data) - session.current_index) * session.admin_config_snapshot["seconds_per_question"] + 300
-    await redis_service.set_session(telegram_id, session, ttl)
-    
-    # Небольшая пауза перед следующим вопросом
+    await redis_service.set_session(cb.from_user.id, session)
+
     await asyncio.sleep(1)
-    await ask_next_question(callback.message, state)
+    await ask_next_question(cb.message, state)
 
 
-async def _save_result_and_notify_user(message: Message, state: FSMContext, passed: bool, notes: Optional[str] = None, timeout_question: Optional[int] = None):
-    """Завершает тест, сохраняет результат и уведомляет пользователя."""
+async def finish_test(message: Message, state: FSMContext, passed: bool, notes: Optional[str] = None):
     data = await state.get_data()
-    user_data = data.get("user_data")
-    
-    if not user_data:
-        user_data = {
-            "id": message.from_user.id,
-            "username": message.from_user.username,
-            "first_name": message.from_user.first_name,
-            "last_name": message.from_user.last_name
-        }
-    
-    telegram_id = user_data["id"]
-    session_dict = data.get("session", {})
-    questions_data = data.get("questions", [])
-    
-    if not session_dict:
-        await message.answer("⚠️ Ошибка: данные сессии не найдены.")
+    user_data = data.get("user_data", {})
+    session = Session.from_dict(data.get("session", {}))
+
+    if not session or not user_data:
+        logger.error(f"Не найдены данные сессии для {message.from_user.id} при завершении теста.")
+        await message.answer("⚠️ Ошибка: не удалось найти данные сессии для сохранения результата.")
         await state.clear()
         return
 
-    session = Session.from_dict(session_dict)
     result_text = "Пройден" if passed else "Не пройден"
-    
-    final_notes = notes
-    if timeout_question:
-        timeout_note = f"таймаут на вопрос #{timeout_question}"
-        final_notes = f"{timeout_note}; {notes}" if notes else timeout_note
+    final_status = "успешно" if passed else "не пройдено"
 
     try:
         tz = pytz.timezone("Europe/Moscow")
-        now = datetime.now(tz)
-        test_date = now.strftime("%Y-%m-%d %H:%M")
-        
-        display_name = user_data.get("username") or " ".join(filter(None, [user_data.get("first_name"), user_data.get("last_name")])).strip()
+        test_date = datetime.now(tz).isoformat()
+        display_name = user_data.get("username") or f"{user_data.get('first_name', '')} {user_data.get('last_name', '')}".strip()
 
         sheets_service.write_result(
-            telegram_id=telegram_id,
+            telegram_id=user_data["id"],
             display_name=display_name,
             test_date=test_date,
             fio=session.fio,
             result=result_text,
             correct_count=session.correct_count,
-            notes=final_notes
+            notes=notes,
+            campaign_name=session.campaign_name,
+            final_status=final_status,
         )
     except Exception as e:
-        logger.error(f"Ошибка записи результата в Google Sheets: {e}")
-        await message.answer("⚠️ Результат не удалось сохранить. Обратитесь к администратору.")
-    
+        logger.error(f"Ошибка записи результата в Google Sheets: {e}", exc_info=True)
+        await message.answer("⚠️ Не удалось сохранить результат. Обратитесь к администратору.")
+
+    total_questions = len(data.get("questions", []))
     logger.info(
-        f"Тест завершен для {telegram_id}: FIO={session.fio}, result={result_text}, correct={session.correct_count}/{len(questions_data)}"
+        f"Тест завершен для {user_data['id']}: FIO={session.fio}, result={result_text}, "
+        f"correct={session.correct_count}/{total_questions}"
     )
-    
+
     if passed:
-        await message.answer(
-            "✅ Тест успешно пройден!\n\n"
-            "Спасибо за обратную связь и ответственное отношение к работе."
-        )
+        await message.answer(f"✅ Тест «{session.campaign_name}» успешно пройден!\n\nРезультат: {session.correct_count} из {total_questions}")
     else:
-        await message.answer(
-            "❌ Тест не пройден.\n\n"
-            "📚 Необходимо повторить материалы. Повторная попытка станет доступна через 24 часа.\n\n"
-            "Спасибо за обратную связь."
-        )
-    
-    await redis_service.delete_session(telegram_id)
+        await message.answer(f"❌ Тест «{session.campaign_name}» не пройден.\n\nПовторная попытка будет доступна согласно правилам кампании.")
+
+    await redis_service.delete_session(user_data["id"])
     await state.clear()
-
-
-async def finish_test(message: Message, state: FSMContext, passed: bool, timeout_question: Optional[int] = None):
-    """Завершает основную часть теста и запрашивает финальный комментарий."""
-    await state.update_data(test_passed=passed, timeout_question=timeout_question)
-    
-    final_question_text = (
-        "❓ Какой один конкретный процесс в работе автоколонны, по вашему мнению, требует улучшения в первую очередь — "
-        "и что именно в нём нужно изменить, чтобы улучшить работу? Ваш ответ будет передан руководству ГК «Лагранж»"
-    )
-    
-    await message.answer(final_question_text)
-    await state.set_state(TestStates.WAIT_FINAL_NOTE)
-
-
-@router.message(TestStates.WAIT_FINAL_NOTE, F.text)
-async def process_final_note(message: Message, state: FSMContext):
-    """Обрабатывает финальный комментарий и завершает тест."""
-    note = message.text
-    if len(note) > 1024:
-        await message.answer("Слишком длинный ответ. Пожалуйста, сократите его до 1024 символов.")
-        return
-        
-    data = await state.get_data()
-    passed = data.get("test_passed", False)
-    timeout_question = data.get("timeout_question")
-    
-    await _save_result_and_notify_user(message, state, passed=passed, notes=note, timeout_question=timeout_question)
-
-
-@router.message(TestStates.WAIT_FINAL_NOTE)
-async def process_final_note_invalid(message: Message, state: FSMContext):
-    """Обрабатывает нетекстовый ввод для финального комментария."""
-    await message.answer("Пожалуйста, введите ваш комментарий в виде текста.")
 

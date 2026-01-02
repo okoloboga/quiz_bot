@@ -1,130 +1,142 @@
 import logging
-import time
 from datetime import timedelta
 
-from aiogram import Router, F
+from aiogram import F, Router
 from aiogram.filters import Command
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from services.google_sheets import GoogleSheetsService, AdminConfigError
+from aiogram.types import (CallbackQuery, InlineKeyboardButton,
+                           InlineKeyboardMarkup, Message, ReplyKeyboardRemove,
+                           ReplyKeyboardMarkup, KeyboardButton)
+
+from models import CampaignType
+from services.google_sheets import AdminConfigError, GoogleSheetsService
+from handlers.states import Registration
+
 
 logger = logging.getLogger(__name__)
 
 router = Router()
 
-sheets_service = GoogleSheetsService()
-
 
 class TestStates(StatesGroup):
-    START = State()
     COLLECT_FIO = State()
     CONFIRM_FIO = State()
     PREPARE_TEST = State()
     ASKING = State()
     WAIT_ANSWER = State()
-    FINISHED = State()
-    WAIT_FINAL_NOTE = State()
 
 
 @router.message(Command("start"))
-async def cmd_start(message: Message, state: FSMContext):
-    """Обработчик команды /start."""
-    # Проверяем настройки сразу после /start
-    try:
-        admin_config = sheets_service.read_admin_config()
-        logger.info(
-            "Конфигурация загружена: N=%s, M=%s, H=%s, S=%s",
-            admin_config.num_questions,
-            admin_config.max_errors,
-            admin_config.retry_hours,
-            admin_config.seconds_per_question,
-        )
-    except AdminConfigError as e:
-        logger.error(f"Отсутствуют настройки теста: {e}")
-        await message.answer("⚠️ У бота отсутствуют необходимые настройки. Обратитесь к администратору.")
-        await state.clear()
-        return
+async def cmd_start(message: Message, state: FSMContext, google_sheets: GoogleSheetsService):
+    """
+    Единый обработчик команды /start.
+    - Регистрирует новых пользователей.
+    - Информирует пользователей в ожидании.
+    - Запускает кампании для подтвержденных пользователей.
+    """
+    await state.clear()
+    user_id = str(message.from_user.id)
 
-    # Проверка на cooldown
-    last_test_time = sheets_service.get_last_test_time(message.from_user.id)
-    if last_test_time:
-        cooldown_seconds = admin_config.retry_hours * 3600
-        time_passed = time.time() - last_test_time
-        
-        if time_passed < cooldown_seconds:
-            remaining_time = cooldown_seconds - time_passed
-            # Форматируем оставшееся время в ЧЧ:ММ:СС
-            td = timedelta(seconds=int(remaining_time))
-            hours, remainder = divmod(td.seconds, 3600)
-            minutes, seconds = divmod(remainder, 60)
-            remaining_str = f"{hours:02}:{minutes:02}:{seconds:02}"
-            
-            logger.info(
-                f"Пользователь {message.from_user.id} попытался пройти тест раньше времени. "
-                f"Осталось: {remaining_str}"
+    try:
+        user_info = google_sheets.get_user_info(user_id)
+        user_status = user_info.status.value if user_info else None
+
+        # Сценарий 1: Новый пользователь
+        if user_status is None:
+            logger.info(f"Пользователь {user_id} не найден, запуск регистрации.")
+            keyboard = ReplyKeyboardMarkup(
+                keyboard=[
+                    [KeyboardButton(text="Отправить мой номер телефона", request_contact=True)]
+                ],
+                resize_keyboard=True,
+                one_time_keyboard=True
             )
             await message.answer(
-                f"Вы уже проходили тест. Следующая попытка будет доступна через: {remaining_str}"
+                "Добро пожаловать! Для регистрации, пожалуйста, нажмите кнопку ниже, чтобы отправить ваш номер телефона.",
+                reply_markup=keyboard
             )
+            await state.set_state(Registration.waiting_for_phone)
+            return
+
+        # Сценарий 2: Пользователь ожидает подтверждения или отклонен
+        if user_status in ["ожидает", "отклонён"]:
+            logger.info(f"Пользователь {user_id} имеет статус '{user_status}', доступ ограничен.")
+            await message.answer(f"Ваша учетная запись находится в статусе '{user_status}'. Пожалуйста, дождитесь подтверждения администратором.")
+            return
+
+        # Сценарий 3: Подтвержденный пользователь -> ищем кампанию
+        if user_status == "подтверждён":
+            campaign = google_sheets.get_active_campaign_for_user(user_id)
+            if campaign:
+                user_data = {
+                    "id": message.from_user.id, "username": message.from_user.username,
+                    "first_name": message.from_user.first_name, "last_name": message.from_user.last_name,
+                }
+                await state.update_data(user_data=user_data, campaign_name=campaign.name, mode=campaign.type.value)
+
+                deadline_str = campaign.deadline.strftime("%d.%m.%Y")
+                message_text = (
+                    f"👋 Добро пожаловать!\n\n"
+                    f"Для вас доступна учебная кампания: **{campaign.name}**\n\n"
+                    f"🔹 **Тип:** {campaign.type.value}\n"
+                    f"🔹 **Срок прохождения:** до {deadline_str}\n\n"
+                    f"Нажмите «Начать», чтобы приступить."
+                )
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="Начать", callback_data=f"start_campaign")]
+                ])
+                await message.answer(message_text, reply_markup=keyboard, parse_mode="Markdown")
+                logger.info(f"Пользователю {user_id} предложена кампания '{campaign.name}'")
+            else:
+                await message.answer("✅ Для вас пока нет доступных учебных кампаний. Попробуйте проверить позже.")
+                logger.info(f"Для пользователя {user_id} не найдено активных кампаний.")
+
+    except AdminConfigError as e:
+        logger.error(f"Критическая ошибка конфигурации: {e}")
+        await message.answer("⚠️ Бот не настроен. Пожалуйста, обратитесь к администратору.")
+    except Exception as e:
+        logger.error(f"Произошла ошибка при обработке /start для {user_id}: {e}", exc_info=True)
+        await message.answer("Произошла ошибка. Попробуйте позже.")
+
+
+@router.callback_query(F.data == "start_campaign")
+async def start_campaign_callback(callback_query: CallbackQuery, state: FSMContext, google_sheets: GoogleSheetsService):
+    """
+    Обрабатывает нажатие кнопки "Начать кампанию".
+    Проверяет конфигурацию и наличие вопросов перед стартом.
+    """
+    try:
+        admin_config = google_sheets.read_admin_config()
+        all_questions = google_sheets.read_questions()
+
+        if not all_questions:
+            await callback_query.message.answer("❗️ В базе нет вопросов для этой кампании. Обратитесь к администратору.")
             await state.clear()
             return
-    
-    # Проверяем количество вопросов
-    all_questions = sheets_service.read_questions()
-    if not all_questions:
-        await message.answer("❗️ В базе нет вопросов. Обратитесь к администратору.")
-        await state.clear()
-        return
-    
-    if len(all_questions) < admin_config.num_questions:
-        logger.error(
-            "Недостаточно вопросов: доступно %s, требуется %s",
-            len(all_questions),
-            admin_config.num_questions,
+        
+        if len(all_questions) < admin_config.num_questions:
+            logger.warning(
+                "Недостаточно вопросов: доступно %s, требуется %s",
+                len(all_questions), admin_config.num_questions
+            )
+            await callback_query.message.answer("⚠️ Временно недостаточно вопросов для старта. Обратитесь к администратору.")
+            await state.clear()
+            return
+
+        # Если все проверки пройдены, запрашиваем ФИО
+        await state.set_state(TestStates.COLLECT_FIO)
+        await callback_query.message.answer(
+            "Для начала введите ваше ФИО (Фамилия Имя Отчество) одной строкой."
         )
-        await message.answer("⚠️ В боте недостаточно вопросов. Обратитесь к администратору.")
+        await callback_query.answer()
+        logger.info(f"Пользователь {callback_query.from_user.id} начинает кампанию.")
+
+    except AdminConfigError as e:
+        logger.error(f"Отсутствуют настройки теста: {e}")
+        await callback_query.message.answer("⚠️ У бота отсутствуют необходимые настройки. Обратитесь к администратору.")
         await state.clear()
-        return
-    
-    # Сохраняем данные пользователя в state
-    user = message.from_user
-    await state.update_data(user_data={
-        "id": user.id,
-        "username": user.username,
-        "first_name": user.first_name,
-        "last_name": user.last_name
-    })
-    
-    # Отправляем приветственное сообщение с кнопкой
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Начать", callback_data="start_test")]
-    ])
-    
-    welcome_message = (
-        "🚛 Добро пожаловать в систему обязательного тестирования водителей компании\n\n"
-        "📌 Тестирование проводится по прямому указанию руководства и является обязательным для всех водителей ГК Лагранж.\n\n"
-        "🎯 Цель тестов — повысить безопасность, снизить аварийность, сократить простои, сохранить технику и увеличить эффективность и зарплату.\n"
-        "Знания, отработанные до автоматизма, напрямую влияют на вашу безопасность и результат.\n\n"
-        "👤 Перед началом необходимо авторизоваться, указав ФИО.\n"
-        "⏱️ Тест занимает не более 5 минут и включает элементарные вопросы по внутренним регламентам и технической части.\n\n"
-        "📝 По завершении вы получите результат: «Пройдено» или «Не пройдено».\n"
-        "Если тест не пройден, необходимо повторить материал и пересдать через 24 часа.\n\n"
-        "🔁 Тесты проводятся регулярно, поэтому они короткие и направлены на закрепление ключевых правил, которые должны быть на уровне автоматизма.\n\n"
-        "⚠️ Это инструмент, который сохраняет жизни, технику, время и деньги — ваши и компании.\n\n"
-        "👉 Нажмите «Начать», чтобы приступить к тестированию."
-    )
-    
-    await message.answer(welcome_message, reply_markup=keyboard)
-    logger.info(f"Пользователь {message.from_user.id} получил приветственное сообщение")
-
-
-@router.callback_query(F.data == "start_test")
-async def start_test_callback(callback_query: CallbackQuery, state: FSMContext):
-    """Обработчик нажатия кнопки 'Начать'."""
-    await state.set_state(TestStates.COLLECT_FIO)
-    await callback_query.message.answer(
-        "Для начала теста введите ваше ФИО (Фамилия Имя Отчество) одной строкой."
-    )
-    await callback_query.answer()
-    logger.info(f"Пользователь {callback_query.from_user.id} нажал 'Начать'")
+    except Exception as e:
+        logger.error(f"Ошибка при старте кампании: {e}", exc_info=True)
+        await callback_query.message.answer("Произошла ошибка при подготовке к тесту. Попробуйте позже.")
+        await state.clear()

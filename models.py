@@ -1,6 +1,24 @@
 from dataclasses import dataclass, asdict
 from typing import List, Optional
 from datetime import datetime
+from enum import Enum
+
+
+class UserStatus(Enum):
+    AWAITS = "ожидает"
+    CONFIRMED = "подтверждён"
+    REJECTED = "отклонён"
+
+
+class CampaignType(Enum):
+    TRAINING = "Обучение"
+    TESTING = "Тестирование"
+
+
+class CampaignAssignmentType(Enum):
+    ALL = "all"
+    MOTORCADE = "автоколонна"
+    TELEGRAM_ID = "telegram_id"
 
 
 @dataclass
@@ -12,6 +30,8 @@ class Question:
     answer3: str
     answer4: str
     correct_answer: int  # 1-4
+    is_critical: bool  # Критический вопрос
+    explanation: Optional[str]  # Пояснение к ответу
     row_index: int  # индекс строки в таблице
 
 
@@ -34,11 +54,49 @@ class Session:
     last_action_at: float
     per_question_deadline: Optional[float]
     admin_config_snapshot: dict
+    campaign_name: Optional[str] = None  # Название кампании
+    mode: Optional[CampaignType] = None  # Режим: Обучение/Тестирование
 
     def to_dict(self):
-        return asdict(self)
+        # asdict не всегда корректно работает с Enum, поэтому преобразуем вручную
+        data = asdict(self)
+        if self.mode:
+            data['mode'] = self.mode.value
+        return data
 
     @classmethod
     def from_dict(cls, data: dict):
+        # Преобразуем строковое значение mode обратно в Enum
+        if 'mode' in data and data['mode'] is not None:
+            try:
+                data['mode'] = CampaignType(data['mode'])
+            except ValueError:
+                data['mode'] = None  # или установить значение по умолчанию
         return cls(**data)
+
+
+@dataclass
+class UserInfo:
+    telegram_id: str
+    phone: str
+    fio: str
+    motorcade: str
+    status: UserStatus
+
+
+@dataclass
+class Campaign:
+    name: str
+    deadline: datetime
+    type: CampaignType
+    assignment_type: CampaignAssignmentType
+    assignment_value: str
+
+
+@dataclass
+class UserResult:
+    telegram_id: str
+    campaign_name: str
+    final_status: str
+    date: datetime
 

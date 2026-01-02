@@ -25,7 +25,8 @@ class AccessMiddleware(BaseMiddleware):
         # if user_id == Config.ADMIN_TELEGRAM_ID or user_id == Config.OWNER_TELEGRAM_ID:
         #     return await handler(event, data)
 
-        user_status = await google_sheets.get_user_status(user_id)
+        user_info = google_sheets.get_user_info(user_id)
+        user_status = user_info.status.value if user_info else None
         current_state = await state.get_state()
 
         # Если пользователь не зарегистрирован (статуса нет) и не находится в процессе регистрации

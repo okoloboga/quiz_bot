@@ -1,12 +1,17 @@
 import logging
 import re
 import time
+from datetime import datetime
 from typing import List, Optional
+
+import pytz
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from models import Question, AdminConfig
+
 from config import Config
+from models import (AdminConfig, Campaign, CampaignAssignmentType, CampaignType,
+                    Question, UserInfo, UserResult, UserStatus)
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +24,7 @@ USERS_SHEET = "Пользователи"
 QUESTIONS_SHEET = "Вопросы"
 ADMIN_SHEET = "Настройки"
 RESULTS_SHEET = "Результаты"
+CAMPAIGNS_SHEET = "Кампании"
 
 
 class GoogleSheetsService:
@@ -30,53 +36,39 @@ class GoogleSheetsService:
         self.service = build('sheets', 'v4', credentials=credentials)
         self.sheet_id = Config.SHEET_ID
         self.max_retries = 3
-        self.retry_delay = 1  # начальная задержка в секундах
+        self.retry_delay = 1
 
     def _retry_request(self, func, *args, **kwargs):
-        """Выполняет запрос с повторными попытками при ошибках."""
         last_error = None
         for attempt in range(self.max_retries):
             try:
                 request = func(*args, **kwargs)
-                # Google API возвращает объект запроса, нужно вызвать execute()
                 if hasattr(request, 'execute'):
                     return request.execute()
                 return request
             except HttpError as e:
                 last_error = e
-                if e.resp.status in [429, 500, 502, 503, 504]:  # Rate limit или временные ошибки
-                    delay = self.retry_delay * (2 ** attempt)  # экспоненциальная задержка
-                    logger.warning(f"Ошибка Google Sheets API (попытка {attempt + 1}/{self.max_retries}): {e}. Повтор через {delay}с")
+                if e.resp.status in [429, 500, 502, 503, 504]:
+                    delay = self.retry_delay * (2 ** attempt)
+                    logger.warning(
+                        f"Ошибка Google Sheets API (попытка {attempt + 1}/{self.max_retries}): {e}. Повтор через {delay}с")
                     time.sleep(delay)
                 else:
                     raise
             except Exception as e:
                 logger.error(f"Неожиданная ошибка при запросе к Google Sheets: {e}")
                 raise
-        
-        # Если все попытки исчерпаны
         logger.error(f"Не удалось выполнить запрос после {self.max_retries} попыток")
         raise last_error
 
     def add_user(self, telegram_id: str, phone_number: str, fio: str, motorcade: str, status: str = "ожидает"):
-        """Добавляет нового пользователя в лист 'Пользователи'."""
         try:
-            values = [[
-                telegram_id,
-                phone_number,
-                fio,
-                motorcade,
-                status
-            ]]
-            
-            body = {
-                'values': values
-            }
-            
+            values = [[telegram_id, phone_number, fio, motorcade, status]]
+            body = {'values': values}
             self._retry_request(
                 self.service.spreadsheets().values().append,
                 spreadsheetId=self.sheet_id,
-                range=f'{USERS_SHEET}!A:E', # A:E для telegram_id, phone_number, fio, motorcade, status
+                range=f"'{USERS_SHEET}'!A:E",
                 valueInputOption='RAW',
                 insertDataOption='INSERT_ROWS',
                 body=body
@@ -85,87 +77,218 @@ class GoogleSheetsService:
         except Exception as e:
             logger.error(f"Ошибка добавления пользователя в лист '{USERS_SHEET}': {e}")
             raise
-    
-    def get_user_status(self, telegram_id: str) -> Optional[str]:
-        """Получает статус пользователя из листа 'Пользователи'."""
+
+    def get_user_info(self, telegram_id: str) -> Optional[UserInfo]:
         try:
-            # Читаем все данные из листа "Пользователи"
-            range_name = f'{USERS_SHEET}!A:E'
+            range_name = f"'{USERS_SHEET}'!A:E"
             result = self._retry_request(
                 self.service.spreadsheets().values().get,
                 spreadsheetId=self.sheet_id,
                 range=range_name
             )
             values = result.get('values', [])
-
             if not values:
                 return None
-            
-            # Предполагаем, что первая строка - заголовки
-            headers = values[0]
-            
-            # Находим индексы нужных колонок
-            telegram_id_col = -1
-            status_col = -1
-            
-            for i, header in enumerate(headers):
-                if header.lower() == 'telegram_id':
-                    telegram_id_col = i
-                elif header.lower() == 'статус':
-                    status_col = i
-            
-            if telegram_id_col == -1 or status_col == -1:
-                logger.warning(f"В листе '{USERS_SHEET}' не найдены колонки 'telegram_id' или 'статус'")
+
+            headers = [h.lower() for h in values[0]]
+            try:
+                id_col = headers.index('telegram_id')
+                phone_col = headers.index('телефон')
+                fio_col = headers.index('фио')
+                motorcade_col = headers.index('автоколонна')
+                status_col = headers.index('статус')
+            except ValueError as e:
+                logger.error(f"В листе '{USERS_SHEET}' отсутствует обязательная колонка: {e}")
                 return None
 
-            # Ищем пользователя по telegram_id
-            for row in values[1:]: # Пропускаем заголовки
-                if len(row) > telegram_id_col and str(row[telegram_id_col]) == telegram_id:
-                    if len(row) > status_col:
-                        return row[status_col]
-                    break # Нашли пользователя, но нет статуса
-            
-            return None # Пользователь не найден
+            for row in values[1:]:
+                if len(row) > id_col and str(row[id_col]) == telegram_id:
+                    try:
+                        # Убираем пробелы из статуса перед парсингом
+                        status_str = row[status_col].strip()
+                        status = UserStatus(status_str)
+                        
+                        return UserInfo(
+                            telegram_id=str(row[id_col]),
+                            phone=row[phone_col],
+                            fio=row[fio_col],
+                            motorcade=row[motorcade_col],
+                            status=status
+                        )
+                    except (ValueError, IndexError):
+                        original_status = row[status_col] if status_col < len(row) else "[СТАТУС НЕ НАЙДЕН]"
+                        logger.warning(
+                            f"Некорректный статус ('{original_status}') или структура для пользователя {telegram_id}"
+                        )
+                        return None
+            return None
         except Exception as e:
-            logger.error(f"Ошибка получения статуса пользователя {telegram_id} из листа '{USERS_SHEET}': {e}")
+            logger.error(f"Ошибка получения информации о пользователе {telegram_id}: {e}")
             return None
 
+    def get_all_campaigns(self) -> List[Campaign]:
+        campaigns = []
+        try:
+            range_name = f"'{CAMPAIGNS_SHEET}'!A:E"
+            result = self._retry_request(self.service.spreadsheets().values().get, spreadsheetId=self.sheet_id,
+                                          range=range_name)
+            values = result.get('values', [])
+            if len(values) < 2:
+                return []
+
+            headers = [h.lower() for h in values[0]]
+            try:
+                name_col = headers.index('название_кампании')
+                deadline_col = headers.index('дедлайн')
+                type_col = headers.index('тип')
+                assign_type_col = headers.index('тип_назначения')
+                assign_val_col = headers.index('значение_назначения')
+            except ValueError as e:
+                logger.error(f"В листе '{CAMPAIGNS_SHEET}' отсутствует обязательная колонка: {e}")
+                return []
+
+            for row_idx, row in enumerate(values[1:], start=2):
+                try:
+                    name = row[name_col]
+                    if not name: continue
+
+                    deadline = datetime.strptime(row[deadline_col], "%Y-%m-%d")
+                    ctype = CampaignType(row[type_col])
+                    atype = CampaignAssignmentType(row[assign_type_col].lower())
+                    aval = row[assign_val_col] if assign_val_col < len(row) else ""
+
+                    campaigns.append(
+                        Campaign(name=name, deadline=deadline, type=ctype, assignment_type=atype, assignment_value=aval))
+                except (ValueError, IndexError) as e:
+                    logger.warning(f"Ошибка парсинга кампании в строке {row_idx}: {e}")
+                    continue
+            return campaigns
+        except Exception as e:
+            logger.error(f"Ошибка чтения кампаний из листа '{CAMPAIGNS_SHEET}': {e}")
+            return []
+
+    def get_user_results(self, telegram_id: str) -> List[UserResult]:
+        results = []
+        try:
+            range_name = f"'{RESULTS_SHEET}'!A:H"  # Захватываем все нужные колонки
+            result = self._retry_request(self.service.spreadsheets().values().get, spreadsheetId=self.sheet_id,
+                                          range=range_name)
+            values = result.get('values', [])
+            if len(values) < 2:
+                return []
+
+            headers = [h.lower() for h in values[0]]
+            try:
+                id_col = headers.index('telegram_id')
+                date_col = headers.index('дата прохождения теста')
+                campaign_col = headers.index('название_кампании')
+                status_col = headers.index('итоговый_статус')
+            except ValueError as e:
+                logger.error(f"В листе '{RESULTS_SHEET}' отсутствует обязательная колонка: {e}")
+                return []
+
+            for row in values[1:]:
+                if len(row) > id_col and str(row[id_col]) == telegram_id:
+                    try:
+                        date_str = row[date_col]
+                        dt = datetime.fromisoformat(date_str)
+                        results.append(UserResult(
+                            telegram_id=str(row[id_col]),
+                            date=dt,
+                            campaign_name=row[campaign_col],
+                            final_status=row[status_col]
+                        ))
+                    except (ValueError, IndexError) as e:
+                        logger.warning(f"Ошибка парсинга результата для пользователя {telegram_id}: {e}")
+                        continue
+            return results
+        except Exception as e:
+            logger.error(f"Ошибка получения результатов пользователя {telegram_id}: {e}")
+            return []
+
+    def get_active_campaign_for_user(self, telegram_id: str) -> Optional[Campaign]:
+        user_info = self.get_user_info(telegram_id)
+        if not user_info:
+            logger.warning(f"Для telegram_id {telegram_id} не найдена информация о пользователе.")
+            return None
+
+        all_campaigns = self.get_all_campaigns()
+        user_results = self.get_user_results(telegram_id)
+        
+        # Создаем словарь для последнего результата по каждой кампании
+        # Сортируем результаты по дате, чтобы гарантировать, что мы берем последний
+        user_results.sort(key=lambda r: r.date, reverse=True)
+        latest_results = {res.campaign_name: res.final_status for res in reversed(user_results)}
+
+        today = datetime.now()
+
+        for campaign in all_campaigns:
+            # 1. Проверка дедлайна
+            if campaign.deadline.date() < today.date():
+                continue
+
+            # 2. Проверка назначения
+            assigned = False
+            if campaign.assignment_type == CampaignAssignmentType.ALL:
+                assigned = True
+            elif campaign.assignment_type == CampaignAssignmentType.MOTORCADE:
+                if user_info.motorcade == campaign.assignment_value:
+                    assigned = True
+            elif campaign.assignment_type == CampaignAssignmentType.TELEGRAM_ID:
+                if user_info.telegram_id == campaign.assignment_value:
+                    assigned = True
+            
+            if not assigned:
+                continue
+
+            # 3. Проверка статуса прохождения
+            last_status = latest_results.get(campaign.name)
+            
+            # Если статуса нет - кампания доступна
+            if last_status is None:
+                logger.info(f"Найдена активная кампания '{campaign.name}' для пользователя {telegram_id} (ранее не проходил).")
+                return campaign
+            
+            # Если статус 'разрешена пересдача' - кампания доступна
+            if last_status == "разрешена пересдача":
+                logger.info(f"Найдена активная кампания '{campaign.name}' для пользователя {telegram_id} (разрешена пересдача).")
+                return campaign
+            
+            # В остальных случаях (пройден, не пройден и т.д.) - кампания недоступна
+            # (Логика "не пройден" может быть изменена, но пока считаем любую попытку, кроме пересдачи, завершенной)
+
+        logger.info(f"Для пользователя {telegram_id} не найдено активных кампаний.")
+        return None
 
     def read_admin_config(self) -> AdminConfig:
-        """Читает конфигурацию из листа Настройки."""
         try:
-            range_name = f'{ADMIN_SHEET}!A1:D2'  # Заголовки в A1-D1, значения в A2-D2
+            range_name = f"'{ADMIN_SHEET}'!A1:D2"
             result = self._retry_request(
                 self.service.spreadsheets().values().get,
                 spreadsheetId=self.sheet_id,
                 range=range_name
             )
             values = result.get('values', [])
-            
+
             if len(values) < 2:
                 raise AdminConfigError("Лист Настройки должен содержать заголовки и значения")
-            
-            # Ищем значения по заголовкам
-            headers = values[0] if len(values) > 0 else []
-            data_row = values[1] if len(values) > 1 else []
-            
-            config_dict = {}
-            for i, header in enumerate(headers):
-                if i < len(data_row):
-                    config_dict[header.lower()] = data_row[i]
-            
+
+            headers = values[0]
+            data_row = values[1]
+            config_dict = {header.lower(): data_row[i] for i, header in enumerate(headers) if i < len(data_row)}
+
             required_fields = {
                 'количество вопросов': 'num_questions',
                 'количество допустимых ошибок': 'max_errors',
                 'как часто можно проходить тест (часов)': 'retry_hours',
                 'количество секунд на одно задание': 'seconds_per_question',
             }
-
             parsed_values = {}
             missing_fields = []
+
             for header_key, attr_name in required_fields.items():
                 raw_value = config_dict.get(header_key)
-                if raw_value is None or str(raw_value).strip() == '':
+                if not raw_value or not str(raw_value).strip():
                     missing_fields.append(header_key)
                     continue
                 try:
@@ -174,16 +297,9 @@ class GoogleSheetsService:
                     raise AdminConfigError(f"Поле '{header_key}' должно быть целым числом")
 
             if missing_fields:
-                raise AdminConfigError(
-                    "Не заполнены обязательные поля: " + ", ".join(missing_fields)
-                )
-            
-            return AdminConfig(
-                num_questions=parsed_values['num_questions'],
-                max_errors=parsed_values['max_errors'],
-                retry_hours=parsed_values['retry_hours'],
-                seconds_per_question=parsed_values['seconds_per_question']
-            )
+                raise AdminConfigError("Не заполнены обязательные поля: " + ", ".join(missing_fields))
+
+            return AdminConfig(**parsed_values)
         except AdminConfigError:
             raise
         except Exception as e:
@@ -191,259 +307,149 @@ class GoogleSheetsService:
             raise
 
     def read_questions(self) -> List[Question]:
-        """Читает все вопросы из листа Вопросы."""
         try:
-            range_name = f'{QUESTIONS_SHEET}!A:H'  # Категория, Вопрос, Ответ 1-4, Правильный ответ, ID
+            range_name = f"'{QUESTIONS_SHEET}'!A:J"  # Расширяем диапазон
             result = self._retry_request(
                 self.service.spreadsheets().values().get,
                 spreadsheetId=self.sheet_id,
                 range=range_name
             )
             values = result.get('values', [])
-            
-            if len(values) < 2:
-                return []
-            
-            headers = values[0]
-            questions = []
-            
-            # Находим индексы колонок
-            header_map = {}
-            for i, header in enumerate(headers):
-                header_lower = header.lower().strip()
-                if 'категория' in header_lower:
-                    header_map['category'] = i
-                elif 'вопрос' in header_lower:
-                    header_map['question'] = i
-                elif 'ответ 1' in header_lower or 'ответ1' in header_lower:
-                    header_map['answer1'] = i
-                elif 'ответ 2' in header_lower or 'ответ2' in header_lower:
-                    header_map['answer2'] = i
-                elif 'ответ 3' in header_lower or 'ответ3' in header_lower:
-                    header_map['answer3'] = i
-                elif 'ответ 4' in header_lower or 'ответ4' in header_lower:
-                    header_map['answer4'] = i
-                elif 'правильный ответ' in header_lower:
-                    header_map['correct'] = i
-            
-            # Читаем строки данных
-            for row_idx, row in enumerate(values[1:], start=2):
-                if len(row) < max(header_map.values()) + 1:
-                    continue
-                
-                try:
-                    def get_value(key, default_index):
-                        idx = header_map.get(key)
-                        if idx is None:
-                            idx = default_index
-                        if idx is None or idx >= len(row):
-                            return ''
-                        return row[idx].strip()
+            if len(values) < 2: return []
 
-                    category = get_value('category', 0)
-                    question_text = get_value('question', 1)
-                    if not category or not question_text:
-                        logger.warning(f"Строка {row_idx}: категория или текст вопроса пустые")
+            headers = [h.lower().strip() for h in values[0]]
+            questions = []
+
+            # Динамически находим индексы
+            try:
+                h = {
+                    'cat': headers.index('категория'), 'q': headers.index('вопрос'),
+                    'a1': headers.index('ответ 1'), 'a2': headers.index('ответ 2'),
+                    'a3': headers.index('ответ 3'), 'a4': headers.index('ответ 4'),
+                    'correct': headers.index('правильный ответ'),
+                    'crit': headers.index('критический_вопрос'),
+                    'exp': headers.index('пояснение')
+                }
+            except ValueError as e:
+                logger.error(f"В листе '{QUESTIONS_SHEET}' отсутствует обязательная колонка: {e}")
+                return []
+
+
+            for row_idx, row in enumerate(values[1:], start=2):
+                try:
+                    # Используем get для безопасного доступа
+                    get = lambda index: row[index].strip() if index < len(row) and row[index] else ""
+
+                    question_text = get(h['q'])
+                    if not get(h['cat']) or not question_text:
                         continue
-                    def get_answer(key, default_index):
-                        idx = header_map.get(key)
-                        if idx is None:
-                            idx = default_index
-                        if idx is None or idx >= len(row):
-                            return ''
-                        return row[idx].strip()
-                    
-                    answer1 = get_answer('answer1', 2)
-                    answer2 = get_answer('answer2', 3)
-                    answer3 = get_answer('answer3', 4)
-                    answer4 = get_answer('answer4', 5)
-                    answer_list = [answer1, answer2, answer3, answer4]
-                    non_empty_answers = [ans for ans in answer_list if ans]
-                    if len(non_empty_answers) < 2:
-                        logger.warning(f"Строка {row_idx}: недостаточно вариантов ответов (минимум 2)")
+
+                    answers = [get(h['a1']), get(h['a2']), get(h['a3']), get(h['a4'])]
+                    if len([ans for ans in answers if ans]) < 2:
                         continue
-                    
-                    correct_str = row[header_map.get('correct', 6)] if header_map.get('correct') is not None else ''
-                    try:
-                        correct_answer = int(correct_str)
-                        if correct_answer not in [1, 2, 3, 4]:
-                            logger.warning(f"Строка {row_idx}: Правильный ответ должен быть 1-4, получено {correct_answer}")
-                            continue
-                    except (ValueError, TypeError):
-                        logger.warning(f"Строка {row_idx}: Неверный формат правильного ответа: {correct_str}")
+
+                    correct_answer = int(get(h['correct']))
+                    if not (1 <= correct_answer <= 4 and answers[correct_answer - 1]):
                         continue
-                    
-                    if correct_answer > len(answer_list) or correct_answer < 1:
-                        logger.warning(f"Строка {row_idx}: индекс правильного ответа вне диапазона: {correct_answer}")
-                        continue
-                    if not answer_list[correct_answer - 1]:
-                        logger.warning(f"Строка {row_idx}: правильный ответ указывает на пустой вариант")
-                        continue
-                    
-                    question = Question(
-                        category=category.strip(),
-                        question_text=question_text.strip(),
-                        answer1=answer1.strip(),
-                        answer2=answer2.strip(),
-                        answer3=answer3.strip(),
-                        answer4=answer4.strip(),
-                        correct_answer=correct_answer,
-                        row_index=row_idx
-                    )
-                    questions.append(question)
-                except Exception as e:
-                    logger.warning(f"Ошибка парсинга строки {row_idx}: {e}")
+
+                    is_critical = get(h['crit']).upper() == 'TRUE'
+                    explanation = get(h['exp'])
+
+                    questions.append(Question(
+                        category=get(h['cat']), question_text=question_text,
+                        answer1=answers[0], answer2=answers[1], answer3=answers[2], answer4=answers[3],
+                        correct_answer=correct_answer, is_critical=is_critical,
+                        explanation=explanation, row_index=row_idx
+                    ))
+                except (ValueError, IndexError) as e:
+                    logger.warning(f"Ошибка парсинга вопроса в строке {row_idx}: {e}")
                     continue
-            
+
             return questions
         except Exception as e:
-            logger.error(f"Ошибка чтения вопросов (❓Вопросы): {e}")
+            logger.error(f"Ошибка чтения вопросов ({QUESTIONS_SHEET}): {e}")
             return []
 
     def get_last_test_time(self, telegram_id: int) -> Optional[float]:
-        """Возвращает timestamp последнего прохождения теста для пользователя."""
         try:
-            # Читаем колонки A (ID) и C (Дата)
-            range_name = f'{RESULTS_SHEET}!A:C'
+            range_name = f"'{RESULTS_SHEET}'!A:C"
             result = self._retry_request(
                 self.service.spreadsheets().values().get,
                 spreadsheetId=self.sheet_id,
                 range=range_name
             )
             values = result.get('values', [])
+            if len(values) < 2: return None
 
-            if len(values) < 2:  # Нет данных кроме заголовка
-                return None
-
-            # Ищем последнюю запись для этого telegram_id, идя с конца
             telegram_id_str = str(telegram_id)
-            for row in reversed(values[1:]):  # Пропускаем заголовок
-                if not row:
-                    continue
-                
-                # Убедимся, что в строке есть и ID, и дата
-                if str(row[0]) == telegram_id_str:
-                    if len(row) > 2 and row[2]:
-                        date_str = row[2]
-                        from datetime import datetime
-                        import pytz
-
-                        try:
-                            # Новый формат: 2025-11-28T12:35:01.837738+03:00
-                            dt = datetime.fromisoformat(date_str)
-                            return dt.timestamp()
-                        except ValueError:
-                            # Обработка других форматов
-                            try:
-                                # Формат с секундами, но без таймзоны
-                                dt_naive = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
-                            except ValueError:
-                                try:
-                                    # Формат без секунд и без таймзоны
-                                    dt_naive = datetime.strptime(date_str, "%Y-%m-%d %H:%M")
-                                except ValueError:
-                                    logger.warning(f"Не удалось распознать формат даты '{date_str}' для пользователя {telegram_id}")
-                                    continue # Ищем дальше, вдруг есть более ранняя запись в правильном формате
-
-                            # Локализуем старые даты в Московской таймзоне
-                            tz = pytz.timezone("Europe/Moscow")
-                            dt_aware = tz.localize(dt_naive)
-                            return dt_aware.timestamp()
-                    else:
-                        # Нашли пользователя, но дата пустая, ищем дальше
+            for row in reversed(values[1:]):
+                if not row: continue
+                if str(row[0]) == telegram_id_str and len(row) > 2 and row[2]:
+                    try:
+                        return datetime.fromisoformat(row[2]).timestamp()
+                    except ValueError:
+                        logger.warning(f"Не удалось распознать формат даты '{row[2]}'")
                         continue
-            
-            return None  # Не найдено записей для пользователя
+            return None
         except Exception as e:
             logger.error(f"Ошибка получения времени последнего теста: {e}")
             return None
 
-    def write_result(
-        self,
-        telegram_id: int,
-        display_name: str,
-        test_date: str,
-        fio: str,
-        result: str,
-        correct_count: int,
-        notes: Optional[str] = None
-    ):
+    def write_result(self, telegram_id: int, display_name: str, test_date: str, fio: str, result: str,
+                     correct_count: int, campaign_name: str, final_status: str, notes: Optional[str] = None):
         """Записывает результат теста в лист Результаты."""
         try:
             values = [[
-                str(telegram_id),
-                display_name or '',
-                test_date,
-                fio,
-                result,
-                str(correct_count),
-                notes or ''
+                str(telegram_id), display_name or '', test_date, fio, result,
+                str(correct_count), notes or '', final_status, campaign_name
             ]]
-            
-            body = {
-                'values': values
-            }
-            
-            # Добавляем строку
+            body = {'values': values}
+
+            # Находим правильный диапазон, включая новые колонки
+            range_to_append = f"'{RESULTS_SHEET}'!A:I" # A-I, 9 колонок
+
             append_result = self._retry_request(
                 self.service.spreadsheets().values().append,
-                spreadsheetId=self.sheet_id,
-                range=f'{RESULTS_SHEET}!A:G',
-                valueInputOption='RAW',
-                insertDataOption='INSERT_ROWS',
-                body=body
+                spreadsheetId=self.sheet_id, range=range_to_append,
+                valueInputOption='RAW', insertDataOption='INSERT_ROWS', body=body
             )
-            
-            # Получаем номер добавленной строки из ответа
+
             updated_range = append_result.get('updates', {}).get('updatedRange', '')
             if updated_range:
-                # Парсим номер строки из формата "📊Результаты!A5:G5" или "A5:G5"
                 match = re.search(r'!?A(\d+):', updated_range)
                 if match:
                     row_number = int(match.group(1))
-                    
-                    # Очищаем форматирование добавленной строки
-                    clear_format_body = {
-                        'requests': [{
-                            'repeatCell': {
-                                'range': {
-                                    'sheetId': self._get_sheet_id(RESULTS_SHEET),
-                                    'startRowIndex': row_number - 1,  # 0-based
-                                    'endRowIndex': row_number,
-                                    'startColumnIndex': 0,
-                                    'endColumnIndex': 7  # A-G (7 колонок)
-                                },
-                                'cell': {
-                                    'userEnteredFormat': {}
-                                },
-                                'fields': 'userEnteredFormat'
-                            }
-                        }]
-                    }
-                    
                     try:
-                        self._retry_request(
-                            self.service.spreadsheets().batchUpdate,
-                            spreadsheetId=self.sheet_id,
-                            body=clear_format_body
-                        )
+                        sheet_id = self._get_sheet_id(RESULTS_SHEET)
+                        if sheet_id is not None:
+                            clear_format_body = {'requests': [{'repeatCell': {
+                                'range': {
+                                    'sheetId': sheet_id,
+                                    'startRowIndex': row_number - 1, 'endRowIndex': row_number,
+                                    'startColumnIndex': 0, 'endColumnIndex': 9
+                                },
+                                'cell': {'userEnteredFormat': {}},
+                                'fields': 'userEnteredFormat'
+                            }}]}
+                            self._retry_request(
+                                self.service.spreadsheets().batchUpdate,
+                                spreadsheetId=self.sheet_id, body=clear_format_body
+                            )
                     except Exception as e:
                         logger.warning(f"Не удалось очистить форматирование строки {row_number}: {e}")
-            
-            logger.info(f"Результат записан (📊Результаты) для telegram_id={telegram_id}")
+
+            logger.info(f"Результат записан ({RESULTS_SHEET}) для telegram_id={telegram_id}")
         except Exception as e:
-            logger.error(f"Ошибка записи результата (📊Результаты): {e}")
+            logger.error(f"Ошибка записи результата ({RESULTS_SHEET}): {e}")
             raise
-    
+
     def _get_sheet_id(self, sheet_name: str) -> Optional[int]:
-        """Получает ID листа по его названию."""
         try:
             spreadsheet = self._retry_request(
                 self.service.spreadsheets().get,
                 spreadsheetId=self.sheet_id
             )
-            sheets = spreadsheet.get('sheets', [])
-            for sheet in sheets:
+            for sheet in spreadsheet.get('sheets', []):
                 if sheet.get('properties', {}).get('title') == sheet_name:
                     return sheet.get('properties', {}).get('sheetId')
             return None
