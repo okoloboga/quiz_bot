@@ -10,7 +10,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from config import Config
-from models import (AdminConfig, Campaign, CampaignAssignmentType, CampaignType,
+from models import (AdminConfig, Campaign, CampaignStats, CampaignType,
                     Question, UserInfo, UserResult, UserStatus)
 
 logger = logging.getLogger(__name__)
@@ -129,7 +129,7 @@ class GoogleSheetsService:
     def get_all_campaigns(self) -> List[Campaign]:
         campaigns = []
         try:
-            range_name = f"'{CAMPAIGNS_SHEET}'!A:E"
+            range_name = f"'{CAMPAIGNS_SHEET}'!A:D"
             result = self._retry_request(self.service.spreadsheets().values().get, spreadsheetId=self.sheet_id,
                                           range=range_name)
             values = result.get('values', [])
@@ -138,11 +138,10 @@ class GoogleSheetsService:
 
             headers = [h.lower() for h in values[0]]
             try:
-                name_col = headers.index('название_кампании')
+                name_col = headers.index('название кампании')
                 deadline_col = headers.index('дедлайн')
                 type_col = headers.index('тип')
-                assign_type_col = headers.index('тип_назначения')
-                assign_val_col = headers.index('значение_назначения')
+                assignment_col = headers.index('назначение')
             except ValueError as e:
                 logger.error(f"В листе '{CAMPAIGNS_SHEET}' отсутствует обязательная колонка: {e}")
                 return []
@@ -154,11 +153,10 @@ class GoogleSheetsService:
 
                     deadline = datetime.strptime(row[deadline_col], "%Y-%m-%d")
                     ctype = CampaignType(row[type_col])
-                    atype = CampaignAssignmentType(row[assign_type_col].lower())
-                    aval = row[assign_val_col] if assign_val_col < len(row) else ""
+                    assignment = row[assignment_col].strip() if assignment_col < len(row) and row[assignment_col] else ""
 
                     campaigns.append(
-                        Campaign(name=name, deadline=deadline, type=ctype, assignment_type=atype, assignment_value=aval))
+                        Campaign(name=name, deadline=deadline, type=ctype, assignment=assignment))
                 except (ValueError, IndexError) as e:
                     logger.warning(f"Ошибка парсинга кампании в строке {row_idx}: {e}")
                     continue
@@ -181,8 +179,8 @@ class GoogleSheetsService:
             try:
                 id_col = headers.index('telegram_id')
                 date_col = headers.index('дата прохождения теста')
-                campaign_col = headers.index('название_кампании')
-                status_col = headers.index('итоговый_статус')
+                campaign_col = headers.index('название кампании')
+                status_col = headers.index('итоговый статус')
             except ValueError as e:
                 logger.error(f"В листе '{RESULTS_SHEET}' отсутствует обязательная колонка: {e}")
                 return []
@@ -228,32 +226,24 @@ class GoogleSheetsService:
                 continue
 
             # 2. Проверка назначения
-            assigned = False
-            if campaign.assignment_type == CampaignAssignmentType.ALL:
-                assigned = True
-            elif campaign.assignment_type == CampaignAssignmentType.MOTORCADE:
-                if user_info.motorcade == campaign.assignment_value:
-                    assigned = True
-            elif campaign.assignment_type == CampaignAssignmentType.TELEGRAM_ID:
-                if user_info.telegram_id == campaign.assignment_value:
-                    assigned = True
-            
-            if not assigned:
-                continue
+            # Если "ВСЕ" - доступно всем, иначе сравниваем с автоколонной пользователя
+            if campaign.assignment.upper() != "ВСЕ":
+                if user_info.motorcade != campaign.assignment:
+                    continue
 
             # 3. Проверка статуса прохождения
             last_status = latest_results.get(campaign.name)
-            
+
             # Если статуса нет - кампания доступна
             if last_status is None:
                 logger.info(f"Найдена активная кампания '{campaign.name}' для пользователя {telegram_id} (ранее не проходил).")
                 return campaign
-            
+
             # Если статус 'разрешена пересдача' - кампания доступна
             if last_status == "разрешена пересдача":
                 logger.info(f"Найдена активная кампания '{campaign.name}' для пользователя {telegram_id} (разрешена пересдача).")
                 return campaign
-            
+
             # В остальных случаях (пройден, не пройден и т.д.) - кампания недоступна
             # (Логика "не пройден" может быть изменена, но пока считаем любую попытку, кроме пересдачи, завершенной)
 
@@ -326,8 +316,8 @@ class GoogleSheetsService:
                     'cat': headers.index('категория'), 'q': headers.index('вопрос'),
                     'a1': headers.index('ответ 1'), 'a2': headers.index('ответ 2'),
                     'a3': headers.index('ответ 3'), 'a4': headers.index('ответ 4'),
-                    'correct': headers.index('правильный ответ'),
-                    'crit': headers.index('критический_вопрос'),
+                    'correct': headers.index('правильный ответ (1-4)'),
+                    'crit': headers.index('критический вопрос'),
                     'exp': headers.index('пояснение')
                 }
             except ValueError as e:
@@ -352,7 +342,7 @@ class GoogleSheetsService:
                     if not (1 <= correct_answer <= 4 and answers[correct_answer - 1]):
                         continue
 
-                    is_critical = get(h['crit']).upper() == 'TRUE'
+                    is_critical = get(h['crit']).upper() == 'ДА'
                     explanation = get(h['exp'])
 
                     questions.append(Question(
@@ -456,4 +446,109 @@ class GoogleSheetsService:
         except Exception as e:
             logger.warning(f"Не удалось получить ID листа {sheet_name}: {e}")
             return None
+
+    def get_campaign_statistics(
+        self, campaign_name: Optional[str] = None
+    ) -> List[CampaignStats]:
+        """Get statistics for campaigns from Results sheet.
+
+        Args:
+            campaign_name: Optional campaign name to filter by.
+                          If None, returns stats for all campaigns.
+
+        Returns:
+            List of CampaignStats objects
+        """
+        try:
+            range_name = f"'{RESULTS_SHEET}'!A:I"
+            result = self._retry_request(
+                self.service.spreadsheets().values().get,
+                spreadsheetId=self.sheet_id,
+                range=range_name,
+            )
+            values = result.get("values", [])
+            if len(values) < 2:
+                return []
+
+            headers = [h.lower() for h in values[0]]
+            try:
+                campaign_col = headers.index("название кампании")
+                status_col = headers.index("итоговый статус")
+                correct_col = headers.index("количество верных ответов")
+            except ValueError as e:
+                logger.error(
+                    f"В листе '{RESULTS_SHEET}' отсутствует обязательная "
+                    f"колонка: {e}"
+                )
+                return []
+
+            # Group results by campaign
+            campaign_data = {}
+            for row in values[1:]:
+                if len(row) <= max(campaign_col, status_col, correct_col):
+                    continue
+
+                c_name = row[campaign_col] if campaign_col < len(row) else ""
+                if not c_name:
+                    continue
+
+                # Filter by campaign name if provided
+                if campaign_name and c_name != campaign_name:
+                    continue
+
+                if c_name not in campaign_data:
+                    campaign_data[c_name] = {
+                        "total": 0,
+                        "passed": 0,
+                        "failed": 0,
+                        "correct_answers": [],
+                    }
+
+                status = row[status_col] if status_col < len(row) else ""
+                campaign_data[c_name]["total"] += 1
+
+                if status == "успешно":
+                    campaign_data[c_name]["passed"] += 1
+                elif status == "не пройдено":
+                    campaign_data[c_name]["failed"] += 1
+
+                # Parse correct answers count
+                try:
+                    correct = (
+                        int(row[correct_col]) if correct_col < len(row) else 0
+                    )
+                    campaign_data[c_name]["correct_answers"].append(correct)
+                except (ValueError, IndexError):
+                    pass
+
+            # Build statistics list
+            stats_list = []
+            for c_name, data in campaign_data.items():
+                total = data["total"]
+                passed = data["passed"]
+                failed = data["failed"]
+                correct_answers = data["correct_answers"]
+
+                pass_rate = (passed / total * 100) if total > 0 else 0.0
+                avg_correct = (
+                    sum(correct_answers) / len(correct_answers)
+                    if correct_answers
+                    else 0.0
+                )
+
+                stats_list.append(
+                    CampaignStats(
+                        campaign_name=c_name,
+                        total_attempts=total,
+                        passed_count=passed,
+                        failed_count=failed,
+                        pass_rate=pass_rate,
+                        avg_correct_answers=avg_correct,
+                    )
+                )
+
+            return stats_list
+        except Exception as e:
+            logger.error(f"Ошибка получения статистики кампаний: {e}", exc_info=True)
+            return []
 

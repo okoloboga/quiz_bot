@@ -6,9 +6,11 @@ from aiogram.fsm.storage.redis import RedisStorage
 from config import Config
 from handlers import common, fio, test # Оставим пока, потом уберем fio и test, если они будут заменены новыми
 from handlers import registration_handlers # Импортируем новый роутер
+from handlers import appeals, admin # Импортируем appeals и admin handlers
 from middlewares.access_middleware import AccessMiddleware # Импортируем middleware
 from services.redis_service import RedisService
 from services.google_sheets import GoogleSheetsService # Импортируем GoogleSheetsService
+from services.scheduler import SchedulerService # Импортируем SchedulerService
 
 # Настройка логирования
 logging.basicConfig(
@@ -63,18 +65,25 @@ async def main():
     dp.include_router(common.router)
     dp.include_router(fio.router)
     dp.include_router(test.router)
+    dp.include_router(appeals.router)
+    dp.include_router(admin.router)
 
     # Передача зависимостей
     dp["google_sheets"] = google_sheets_service
     dp["redis_service"] = redis_service # redis_service уже глобально, но для единообразия
 
+    # Инициализация и запуск scheduler
+    scheduler_service = SchedulerService(bot, google_sheets_service)
+    scheduler_service.start()
+    logger.info("Scheduler started")
 
     logger.info("Бот запущен")
-    
+
     try:
         # Запуск polling
         await dp.start_polling(bot, skip_updates=True)
     finally:
+        scheduler_service.shutdown()
         await bot.session.close()
         await redis_service.disconnect()
         logger.info("Бот остановлен")

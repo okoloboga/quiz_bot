@@ -11,3 +11,8 @@ class Test(StatesGroup):
     asking_question = State()
     waiting_answer = State()
     confirm_fio = State()
+
+
+class Appeal(StatesGroup):
+    waiting_for_message = State()
+    confirm_send = State()

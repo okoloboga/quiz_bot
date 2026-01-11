@@ -15,12 +15,6 @@ class CampaignType(Enum):
     TESTING = "Тестирование"
 
 
-class CampaignAssignmentType(Enum):
-    ALL = "all"
-    MOTORCADE = "автоколонна"
-    TELEGRAM_ID = "telegram_id"
-
-
 @dataclass
 class Question:
     category: str
@@ -89,8 +83,7 @@ class Campaign:
     name: str
     deadline: datetime
     type: CampaignType
-    assignment_type: CampaignAssignmentType
-    assignment_value: str
+    assignment: str  # "ВСЕ" or motorcade name (e.g., "АК-1")
 
 
 @dataclass
@@ -99,4 +92,16 @@ class UserResult:
     campaign_name: str
     final_status: str
     date: datetime
+
+
+@dataclass
+class CampaignStats:
+    """Statistics for a campaign."""
+
+    campaign_name: str
+    total_attempts: int
+    passed_count: int
+    failed_count: int
+    pass_rate: float
+    avg_correct_answers: float
 
