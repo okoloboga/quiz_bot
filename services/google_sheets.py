@@ -144,7 +144,7 @@ class GoogleSheetsService:
             if len(values) < 2:
                 return []
 
-            headers = [h.lower() for h in values[0]]
+            headers = [h.lower().strip() for h in values[0]]
             try:
                 name_col = headers.index('название кампании')
                 deadline_col = headers.index('дедлайн')
@@ -152,6 +152,7 @@ class GoogleSheetsService:
                 assignment_col = headers.index('назначение')
             except ValueError as e:
                 logger.error(f"В листе '{CAMPAIGNS_SHEET}' отсутствует обязательная колонка: {e}")
+                logger.error(f"Доступные заголовки: {headers}")
                 return []
 
             for row_idx, row in enumerate(values[1:], start=2):
@@ -176,14 +177,14 @@ class GoogleSheetsService:
     def get_user_results(self, telegram_id: str) -> List[UserResult]:
         results = []
         try:
-            range_name = f"{RESULTS_SHEET}!A:H"  # Захватываем все нужные колонки
+            range_name = f"{RESULTS_SHEET}!A:I"  # Захватываем все нужные колонки (A-I, 9 столбцов)
             result = self._retry_request(self.service.spreadsheets().values().get, spreadsheetId=self.sheet_id,
                                           range=range_name)
             values = result.get('values', [])
             if len(values) < 2:
                 return []
 
-            headers = [h.lower() for h in values[0]]
+            headers = [h.lower().strip() for h in values[0]]
             try:
                 id_col = headers.index('telegram_id')
                 date_col = headers.index('дата прохождения теста')
@@ -191,6 +192,7 @@ class GoogleSheetsService:
                 status_col = headers.index('итоговый статус')
             except ValueError as e:
                 logger.error(f"В листе '{RESULTS_SHEET}' отсутствует обязательная колонка: {e}")
+                logger.error(f"Доступные заголовки: {headers}")
                 return []
 
             for row in values[1:]:
@@ -198,11 +200,14 @@ class GoogleSheetsService:
                     try:
                         date_str = row[date_col]
                         dt = datetime.fromisoformat(date_str)
+                        # Безопасный доступ к campaign_name и status с fallback
+                        campaign_name = row[campaign_col] if len(row) > campaign_col else ""
+                        final_status = row[status_col] if len(row) > status_col else ""
                         results.append(UserResult(
                             telegram_id=str(row[id_col]),
                             date=dt,
-                            campaign_name=row[campaign_col],
-                            final_status=row[status_col]
+                            campaign_name=campaign_name,
+                            final_status=final_status
                         ))
                     except (ValueError, IndexError) as e:
                         logger.warning(f"Ошибка парсинга результата для пользователя {telegram_id}: {e}")
@@ -375,9 +380,20 @@ class GoogleSheetsService:
             logger.error(f"Ошибка чтения вопросов ({QUESTIONS_SHEET}): {e}")
             return []
 
-    def get_last_test_time(self, telegram_id: int) -> Optional[float]:
+    def get_last_test_time(self, telegram_id: int, campaign_name: Optional[str] = None) -> Optional[float]:
+        """Get timestamp of last test attempt for user.
+
+        Args:
+            telegram_id: User's telegram ID
+            campaign_name: Optional campaign name to filter by.
+                          If None, returns last test for initial test (no campaign).
+                          If empty string "", also matches initial tests.
+
+        Returns:
+            Timestamp of last test, or None if not found
+        """
         try:
-            range_name = f"{RESULTS_SHEET}!A:C"
+            range_name = f"{RESULTS_SHEET}!A:I"
             result = self._retry_request(
                 self.service.spreadsheets().values().get,
                 spreadsheetId=self.sheet_id,
@@ -387,14 +403,38 @@ class GoogleSheetsService:
             if len(values) < 2: return None
 
             telegram_id_str = str(telegram_id)
+            logger.info(f"get_last_test_time: Searching for user {telegram_id_str}, campaign filter: {repr(campaign_name)}")
+
             for row in reversed(values[1:]):
                 if not row: continue
-                if str(row[0]) == telegram_id_str and len(row) > 2 and row[2]:
+                if str(row[0]) != telegram_id_str:
+                    continue
+
+                # Check campaign filter
+                row_campaign = row[8] if len(row) > 8 else ""
+                logger.info(f"Found row for user {telegram_id_str}: row_campaign='{row_campaign}', date={row[2] if len(row) > 2 else 'N/A'}")
+
+                # If filtering for initial test (campaign_name is None or "")
+                if campaign_name is None or campaign_name == "":
+                    if row_campaign:  # Skip if row has a campaign
+                        logger.info(f"Skipping row - has campaign '{row_campaign}' but looking for initial test")
+                        continue
+                # If filtering for specific campaign
+                elif row_campaign != campaign_name:
+                    logger.info(f"Skipping row - campaign mismatch: '{row_campaign}' != '{campaign_name}'")
+                    continue
+
+                # Found matching row, get date
+                if len(row) > 2 and row[2]:
                     try:
-                        return datetime.fromisoformat(row[2]).timestamp()
+                        timestamp = datetime.fromisoformat(row[2]).timestamp()
+                        logger.info(f"Found matching test: date={row[2]}, timestamp={timestamp}")
+                        return timestamp
                     except ValueError:
                         logger.warning(f"Не удалось распознать формат даты '{row[2]}'")
                         continue
+
+            logger.info(f"No matching test found for user {telegram_id_str}")
             return None
         except Exception as e:
             logger.error(f"Ошибка получения времени последнего теста: {e}")
@@ -408,6 +448,7 @@ class GoogleSheetsService:
                 str(telegram_id), display_name or '', test_date, fio, result,
                 str(correct_count), notes or '', final_status, campaign_name
             ]]
+            logger.info(f"Writing result: telegram_id={telegram_id}, campaign_name='{campaign_name}', final_status='{final_status}', date={test_date}")
             body = {'values': values}
 
             # Находим правильный диапазон, включая новые колонки
@@ -485,7 +526,7 @@ class GoogleSheetsService:
             if len(values) < 2:
                 return []
 
-            headers = [h.lower() for h in values[0]]
+            headers = [h.lower().strip() for h in values[0]]
             try:
                 campaign_col = headers.index("название кампании")
                 status_col = headers.index("итоговый статус")
@@ -495,6 +536,7 @@ class GoogleSheetsService:
                     f"В листе '{RESULTS_SHEET}' отсутствует обязательная "
                     f"колонка: {e}"
                 )
+                logger.error(f"Доступные заголовки: {headers}")
                 return []
 
             # Group results by campaign

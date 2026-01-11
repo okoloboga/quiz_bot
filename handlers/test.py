@@ -179,12 +179,15 @@ async def process_answer(cb: CallbackQuery, callback_data: AnswerCallback, state
         await cb.answer("❌ Неверно!", show_alert=False)
 
         if question.is_critical:
-            await cb.message.answer("Вы ошиблись в критическом вопросе. Тест завершен.")
-            await finish_test(cb.message, state, passed=False, notes="неверный ответ на критический вопрос")
+            message_text = "❌ Вы ошиблись в критическом вопросе. Тест завершен."
+            if question.explanation:
+                message_text += f"\n\n💡 Пояснение: {question.explanation}"
+            await cb.message.answer(message_text)
+            await finish_test(cb.message, state, passed=False, notes=f"критический вопрос #{session.current_index + 1}")
             return
 
         if session.mode == CampaignType.TRAINING and question.explanation:
-            await cb.message.answer(f" пояснение: {question.explanation}")
+            await cb.message.answer(f"💡 Пояснение: {question.explanation}")
 
     logger.info(
         f"Ответ п-ля {cb.from_user.id} на в. {session.current_index + 1}: "
@@ -194,7 +197,7 @@ async def process_answer(cb: CallbackQuery, callback_data: AnswerCallback, state
 
     if session.remaining_score <= 0:
         await cb.message.answer("Баллы исчерпаны. Тест завершен.")
-        await finish_test(cb.message, state, passed=False, notes="закончились баллы")
+        await finish_test(cb.message, state, passed=False, notes=f"закончились баллы на вопросе #{session.current_index + 1}")
         return
 
     session.current_index += 1

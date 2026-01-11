@@ -1,5 +1,6 @@
 import logging
-from datetime import timedelta
+import time
+from datetime import datetime, timedelta
 
 from aiogram import F, Router
 from aiogram.filters import Command
@@ -88,6 +89,7 @@ async def cmd_start(message: Message, state: FSMContext, google_sheets: GoogleSh
                 has_taken_init_test = any(not r.campaign_name for r in user_results)
 
                 if not has_taken_init_test:
+                    # Пользователь еще не проходил основной тест - разрешаем
                     message_text = (
                         "👋 Добро пожаловать!\n\n"
                         "Для вас доступен обязательный основной тест. "
@@ -99,8 +101,46 @@ async def cmd_start(message: Message, state: FSMContext, google_sheets: GoogleSh
                     await message.answer(message_text, reply_markup=keyboard)
                     logger.info(f"Пользователю {user_id} предложен основной тест.")
                 else:
-                    await message.answer("✅ Для вас пока нет доступных учебных кампаний или новых тестов. Попробуйте проверить позже.")
-                    logger.info(f"Для пользователя {user_id} не найдено ни кампаний, ни основного теста.")
+                    # Пользователь уже проходил - проверяем cooldown
+                    admin_config = google_sheets.read_admin_config()
+                    last_test_time = google_sheets.get_last_test_time(int(user_id), campaign_name=None)
+
+                    logger.info(f"Cooldown check for user {user_id}: last_test_time={last_test_time}, retry_hours={admin_config.retry_hours}")
+
+                    if last_test_time:
+                        hours_passed = (time.time() - last_test_time) / 3600
+                        hours_required = admin_config.retry_hours
+
+                        logger.info(f"Hours passed: {hours_passed:.2f}, required: {hours_required}")
+
+                        if hours_passed < hours_required:
+                            # Cooldown не прошел
+                            hours_remaining = hours_required - hours_passed
+                            if hours_remaining >= 1:
+                                time_msg = f"{int(hours_remaining)} ч."
+                            else:
+                                minutes_remaining = int(hours_remaining * 60)
+                                time_msg = f"{minutes_remaining} мин."
+
+                            await message.answer(
+                                f"⏳ Вы уже проходили основной тест.\n\n"
+                                f"Повторная попытка будет доступна через {time_msg}\n\n"
+                                f"Правило: можно проходить тест раз в {hours_required} ч."
+                            )
+                            logger.info(f"Пользователь {user_id} заблокирован cooldown (осталось {hours_remaining:.1f} ч.)")
+                            return
+
+                    # Cooldown прошел или не найден - разрешаем retry
+                    message_text = (
+                        "👋 Добро пожаловать!\n\n"
+                        "Вы можете пройти основной тест повторно. "
+                        "Нажмите «Начать», чтобы приступить."
+                    )
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="Начать основной тест", callback_data="start_init_test")]
+                    ])
+                    await message.answer(message_text, reply_markup=keyboard)
+                    logger.info(f"Пользователю {user_id} разрешена повторная попытка основного теста.")
 
     except AdminConfigError as e:
         logger.error(f"Критическая ошибка конфигурации: {e}")
