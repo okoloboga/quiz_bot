@@ -141,7 +141,13 @@ async def ask_next_question(message: Message, state: FSMContext):
 async def check_timeout(message: Message, state: FSMContext, q_index: int, deadline: float):
     await asyncio.sleep(deadline - time.time() + 0.5)
     data = await state.get_data()
-    session = Session.from_dict(data.get("session", {}))
+    session_data = data.get("session")
+
+    # If session doesn't exist, user probably already answered or state was cleared
+    if not session_data:
+        return
+
+    session = Session.from_dict(session_data)
 
     if session and session.current_index == q_index and time.time() >= deadline:
         await message.answer("⏰ Время на ответ истекло. Тест завершен.")
@@ -202,7 +208,11 @@ async def process_answer(cb: CallbackQuery, callback_data: AnswerCallback, state
 
     session.current_index += 1
     await state.update_data(session=session.to_dict())
-    await redis_service.set_session(cb.from_user.id, session)
+
+    # Calculate TTL for remaining questions
+    questions_remaining = len(questions_data) - session.current_index
+    ttl = questions_remaining * session.admin_config_snapshot["seconds_per_question"] + 300
+    await redis_service.set_session(cb.from_user.id, session, ttl)
 
     await asyncio.sleep(1)
     await ask_next_question(cb.message, state)
