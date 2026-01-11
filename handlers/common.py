@@ -11,20 +11,12 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton,
 
 from models import CampaignType
 from services.google_sheets import AdminConfigError, GoogleSheetsService
-from handlers.states import Registration
+from handlers.states import Registration, TestStates
 
 
 logger = logging.getLogger(__name__)
 
 router = Router()
-
-
-class TestStates(StatesGroup):
-    COLLECT_FIO = State()
-    CONFIRM_FIO = State()
-    PREPARE_TEST = State()
-    ASKING = State()
-    WAIT_ANSWER = State()
 
 
 @router.message(Command("start"))
@@ -65,9 +57,10 @@ async def cmd_start(message: Message, state: FSMContext, google_sheets: GoogleSh
             await message.answer(f"Ваша учетная запись находится в статусе '{user_status}'. Пожалуйста, дождитесь подтверждения администратором.")
             return
 
-        # Сценарий 3: Подтвержденный пользователь -> ищем кампанию
+        # Сценарий 3: Подтвержденный пользователь -> ищем кампанию или основной тест
         if user_status == "подтверждён":
             campaign = google_sheets.get_active_campaign_for_user(user_id)
+            # 3.1 Если есть активная кампания
             if campaign:
                 user_data = {
                     "id": message.from_user.id, "username": message.from_user.username,
@@ -84,13 +77,30 @@ async def cmd_start(message: Message, state: FSMContext, google_sheets: GoogleSh
                     f"Нажмите «Начать», чтобы приступить."
                 )
                 keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="Начать", callback_data=f"start_campaign")]
+                    [InlineKeyboardButton(text="Начать", callback_data="start_campaign")]
                 ])
                 await message.answer(message_text, reply_markup=keyboard, parse_mode="Markdown")
                 logger.info(f"Пользователю {user_id} предложена кампания '{campaign.name}'")
+            # 3.2 Если кампаний нет, проверяем, проходил ли пользователь основной тест
             else:
-                await message.answer("✅ Для вас пока нет доступных учебных кампаний. Попробуйте проверить позже.")
-                logger.info(f"Для пользователя {user_id} не найдено активных кампаний.")
+                user_results = google_sheets.get_user_results(user_id)
+                # Ищем хотя бы один результат без названия кампании
+                has_taken_init_test = any(not r.campaign_name for r in user_results)
+
+                if not has_taken_init_test:
+                    message_text = (
+                        "👋 Добро пожаловать!\n\n"
+                        "Для вас доступен обязательный основной тест. "
+                        "Нажмите «Начать», чтобы приступить."
+                    )
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="Начать основной тест", callback_data="start_init_test")]
+                    ])
+                    await message.answer(message_text, reply_markup=keyboard)
+                    logger.info(f"Пользователю {user_id} предложен основной тест.")
+                else:
+                    await message.answer("✅ Для вас пока нет доступных учебных кампаний или новых тестов. Попробуйте проверить позже.")
+                    logger.info(f"Для пользователя {user_id} не найдено ни кампаний, ни основного теста.")
 
     except AdminConfigError as e:
         logger.error(f"Критическая ошибка конфигурации: {e}")
@@ -100,21 +110,25 @@ async def cmd_start(message: Message, state: FSMContext, google_sheets: GoogleSh
         await message.answer("Произошла ошибка. Попробуйте позже.")
 
 
-@router.callback_query(F.data == "start_campaign")
-async def start_campaign_callback(callback_query: CallbackQuery, state: FSMContext, google_sheets: GoogleSheetsService):
+@router.callback_query(F.data.in_({"start_campaign", "start_init_test"}))
+async def start_test_callback(callback_query: CallbackQuery, state: FSMContext, google_sheets: GoogleSheetsService):
     """
-    Обрабатывает нажатие кнопки "Начать кампанию".
-    Проверяет конфигурацию и наличие вопросов перед стартом.
+    Обрабатывает нажатие кнопки "Начать", получает ФИО пользователя из Google Sheets
+    и сразу запускает подготовку к тесту, пропуская ручной ввод ФИО.
     """
+    await callback_query.answer()
+    user_id = str(callback_query.from_user.id)
+    
     try:
+        # 1. Проверяем базовые настройки
         admin_config = google_sheets.read_admin_config()
         all_questions = google_sheets.read_questions()
 
         if not all_questions:
-            await callback_query.message.answer("❗️ В базе нет вопросов для этой кампании. Обратитесь к администратору.")
+            await callback_query.message.answer("❗️ В базе нет вопросов. Обратитесь к администратору.")
             await state.clear()
             return
-        
+
         if len(all_questions) < admin_config.num_questions:
             logger.warning(
                 "Недостаточно вопросов: доступно %s, требуется %s",
@@ -124,19 +138,38 @@ async def start_campaign_callback(callback_query: CallbackQuery, state: FSMConte
             await state.clear()
             return
 
-        # Если все проверки пройдены, запрашиваем ФИО
-        await state.set_state(TestStates.COLLECT_FIO)
-        await callback_query.message.answer(
-            "Для начала введите ваше ФИО (Фамилия Имя Отчество) одной строкой."
-        )
-        await callback_query.answer()
-        logger.info(f"Пользователь {callback_query.from_user.id} начинает кампанию.")
+        # 2. Получаем информацию о пользователе, включая его ФИО
+        user_info = google_sheets.get_user_info(user_id)
+        if not user_info or not user_info.fio:
+            await callback_query.message.answer("⚠️ Не удалось найти ваше ФИО в системе. Пожалуйста, обратитесь к администратору.")
+            await state.clear()
+            return
+            
+        # 3. Обновляем данные сессии в FSM, включая FIO и user_data
+        user_data = {
+            "id": callback_query.from_user.id,
+            "username": callback_query.from_user.username,
+            "first_name": callback_query.from_user.first_name,
+            "last_name": callback_query.from_user.last_name,
+        }
+        await state.update_data(fio=user_info.fio, user_data=user_data)
+
+        # Если это основной тест, еще раз убедимся, что данных кампании нет
+        if callback_query.data == "start_init_test":
+            await state.update_data(campaign_name=None, mode=None)
+
+        logger.info(f"Пользователь {user_id} (ФИО: {user_info.fio}) начинает тест (callback: {callback_query.data}).")
+
+        # 4. Сразу переходим к подготовке теста
+        from handlers.test import prepare_test
+        await state.set_state(TestStates.PREPARE_TEST)
+        await prepare_test(callback_query.message, state)
 
     except AdminConfigError as e:
         logger.error(f"Отсутствуют настройки теста: {e}")
         await callback_query.message.answer("⚠️ У бота отсутствуют необходимые настройки. Обратитесь к администратору.")
         await state.clear()
     except Exception as e:
-        logger.error(f"Ошибка при старте кампании: {e}", exc_info=True)
+        logger.error(f"Ошибка при старте теста: {e}", exc_info=True)
         await callback_query.message.answer("Произошла ошибка при подготовке к тесту. Попробуйте позже.")
         await state.clear()

@@ -7,10 +7,10 @@ class Registration(StatesGroup):
     waiting_for_motorcade = State()
 
 
-class Test(StatesGroup):
-    asking_question = State()
-    waiting_answer = State()
-    confirm_fio = State()
+class TestStates(StatesGroup):
+    PREPARE_TEST = State()
+    ASKING = State()
+    WAIT_ANSWER = State()
 
 
 class Appeal(StatesGroup):

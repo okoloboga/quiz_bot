@@ -4,7 +4,7 @@ import sys
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.redis import RedisStorage
 from config import Config
-from handlers import common, fio, test # Оставим пока, потом уберем fio и test, если они будут заменены новыми
+from handlers import common, test # Оставим пока, потом уберем fio и test, если они будут заменены новыми
 from handlers import registration_handlers # Импортируем новый роутер
 from handlers import appeals, admin # Импортируем appeals и admin handlers
 from middlewares.access_middleware import AccessMiddleware # Импортируем middleware
@@ -63,7 +63,6 @@ async def main():
     # Регистрация роутеров. Важен порядок: registration_handlers должен идти раньше, чтобы перехватить /start
     dp.include_router(registration_handlers.router)
     dp.include_router(common.router)
-    dp.include_router(fio.router)
     dp.include_router(test.router)
     dp.include_router(appeals.router)
     dp.include_router(admin.router)

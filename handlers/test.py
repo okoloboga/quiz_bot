@@ -9,9 +9,9 @@ from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message, InlineKeyboardButton, InlineKeyboardMarkup
 
-from handlers.common import TestStates
+from handlers.states import TestStates
 from models import CampaignType, Question, Session
 from services.google_sheets import GoogleSheetsService
 from services.redis_service import RedisService
@@ -149,12 +149,12 @@ async def check_timeout(message: Message, state: FSMContext, q_index: int, deadl
 
 
 @router.callback_query(TestStates.WAIT_ANSWER, AnswerCallback.filter())
-async def process_answer(cb: CallbackQuery, cbd: AnswerCallback, state: FSMContext):
+async def process_answer(cb: CallbackQuery, callback_data: AnswerCallback, state: FSMContext):
     data = await state.get_data()
     session = Session.from_dict(data.get("session", {}))
     questions_data = data.get("questions", [])
-    
-    if not session or not questions_data or cbd.question_index != session.current_index:
+
+    if not session or not questions_data or callback_data.question_index != session.current_index:
         await cb.answer("⚠️ Ошибка сессии или запоздалый ответ.", show_alert=True)
         return
 
@@ -164,7 +164,7 @@ async def process_answer(cb: CallbackQuery, cbd: AnswerCallback, state: FSMConte
         return
 
     question = Question(**questions_data[session.current_index])
-    is_correct = cbd.answer == question.correct_answer
+    is_correct = callback_data.answer == question.correct_answer
 
     try:
         await cb.message.edit_reply_markup(reply_markup=None)
@@ -188,7 +188,7 @@ async def process_answer(cb: CallbackQuery, cbd: AnswerCallback, state: FSMConte
 
     logger.info(
         f"Ответ п-ля {cb.from_user.id} на в. {session.current_index + 1}: "
-        f"выбран={cbd.answer}, прав={question.correct_answer}, "
+        f"выбран={callback_data.answer}, прав={question.correct_answer}, "
         f"итог={is_correct}, баллы={session.remaining_score}"
     )
 
@@ -218,6 +218,7 @@ async def finish_test(message: Message, state: FSMContext, passed: bool, notes: 
 
     result_text = "Пройден" if passed else "Не пройден"
     final_status = "успешно" if passed else "не пройдено"
+    campaign_name = session.campaign_name or ""  # Используем пустую строку, если имя кампании None
 
     try:
         tz = pytz.timezone("Europe/Moscow")
@@ -232,7 +233,7 @@ async def finish_test(message: Message, state: FSMContext, passed: bool, notes: 
             result=result_text,
             correct_count=session.correct_count,
             notes=notes,
-            campaign_name=session.campaign_name,
+            campaign_name=campaign_name,
             final_status=final_status,
         )
     except Exception as e:
@@ -245,10 +246,11 @@ async def finish_test(message: Message, state: FSMContext, passed: bool, notes: 
         f"correct={session.correct_count}/{total_questions}"
     )
 
+    test_name = f"«{campaign_name}» " if campaign_name else ""
     if passed:
-        await message.answer(f"✅ Тест «{session.campaign_name}» успешно пройден!\n\nРезультат: {session.correct_count} из {total_questions}")
+        await message.answer(f"✅ Тест {test_name}успешно пройден!\n\nРезультат: {session.correct_count} из {total_questions}")
     else:
-        await message.answer(f"❌ Тест «{session.campaign_name}» не пройден.\n\nПовторная попытка будет доступна согласно правилам кампании.")
+        await message.answer(f"❌ Тест {test_name}не пройден.\n\nПовторная попытка будет доступна согласно правилам.")
 
     await redis_service.delete_session(user_data["id"])
     await state.clear()
