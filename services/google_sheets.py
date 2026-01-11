@@ -20,11 +20,11 @@ class AdminConfigError(Exception):
     """Ошибка, возникающая при отсутствии или некорректных настройках в листе ⚙️Настройки."""
 
 
-USERS_SHEET = "Пользователи"
-QUESTIONS_SHEET = "Вопросы"
-ADMIN_SHEET = "Настройки"
-RESULTS_SHEET = "Результаты"
-CAMPAIGNS_SHEET = "Кампании"
+USERS_SHEET = "👩‍👧‍👧Пользователи"
+QUESTIONS_SHEET = "❓Вопросы"
+ADMIN_SHEET = "⚙️Настройки"
+RESULTS_SHEET = "📊Результаты"
+CAMPAIGNS_SHEET = "🚚Кампании"
 
 
 class GoogleSheetsService:
@@ -68,7 +68,7 @@ class GoogleSheetsService:
             self._retry_request(
                 self.service.spreadsheets().values().append,
                 spreadsheetId=self.sheet_id,
-                range=f"'{USERS_SHEET}'!A:E",
+                range=f"{USERS_SHEET}!A:E",
                 valueInputOption='RAW',
                 insertDataOption='INSERT_ROWS',
                 body=body
@@ -80,7 +80,7 @@ class GoogleSheetsService:
 
     def get_user_info(self, telegram_id: str) -> Optional[UserInfo]:
         try:
-            range_name = f"'{USERS_SHEET}'!A:E"
+            range_name = f"{USERS_SHEET}!A:E"
             result = self._retry_request(
                 self.service.spreadsheets().values().get,
                 spreadsheetId=self.sheet_id,
@@ -118,9 +118,17 @@ class GoogleSheetsService:
                     except (ValueError, IndexError):
                         original_status = row[status_col] if status_col < len(row) else "[СТАТУС НЕ НАЙДЕН]"
                         logger.warning(
-                            f"Некорректный статус ('{original_status}') или структура для пользователя {telegram_id}"
+                            f"Некорректный статус ('{original_status}') для пользователя {telegram_id}. "
+                            f"Пользователь будет считаться ожидающим подтверждения."
                         )
-                        return None
+                        # Возвращаем пользователя со статусом 'ожидает', чтобы он не начал регистрацию заново
+                        return UserInfo(
+                            telegram_id=str(row[id_col]),
+                            phone=row[phone_col],
+                            fio=row[fio_col],
+                            motorcade=row[motorcade_col],
+                            status=UserStatus.AWAITS
+                        )
             return None
         except Exception as e:
             logger.error(f"Ошибка получения информации о пользователе {telegram_id}: {e}")
@@ -129,7 +137,7 @@ class GoogleSheetsService:
     def get_all_campaigns(self) -> List[Campaign]:
         campaigns = []
         try:
-            range_name = f"'{CAMPAIGNS_SHEET}'!A:D"
+            range_name = f"{CAMPAIGNS_SHEET}!A:D"
             result = self._retry_request(self.service.spreadsheets().values().get, spreadsheetId=self.sheet_id,
                                           range=range_name)
             values = result.get('values', [])
@@ -168,7 +176,7 @@ class GoogleSheetsService:
     def get_user_results(self, telegram_id: str) -> List[UserResult]:
         results = []
         try:
-            range_name = f"'{RESULTS_SHEET}'!A:H"  # Захватываем все нужные колонки
+            range_name = f"{RESULTS_SHEET}!A:H"  # Захватываем все нужные колонки
             result = self._retry_request(self.service.spreadsheets().values().get, spreadsheetId=self.sheet_id,
                                           range=range_name)
             values = result.get('values', [])
@@ -252,7 +260,7 @@ class GoogleSheetsService:
 
     def read_admin_config(self) -> AdminConfig:
         try:
-            range_name = f"'{ADMIN_SHEET}'!A1:D2"
+            range_name = f"{ADMIN_SHEET}!A1:E2"  # Расширяем диапазон до E
             result = self._retry_request(
                 self.service.spreadsheets().values().get,
                 spreadsheetId=self.sheet_id,
@@ -289,6 +297,13 @@ class GoogleSheetsService:
             if missing_fields:
                 raise AdminConfigError("Не заполнены обязательные поля: " + ", ".join(missing_fields))
 
+            # Чтение и парсинг автоколонн
+            motorcades_raw = config_dict.get('автоколонны')
+            if motorcades_raw and isinstance(motorcades_raw, str):
+                motorcades_list = [mc.strip() for mc in motorcades_raw.split(';') if mc.strip()]
+                if motorcades_list:
+                    parsed_values['motorcades'] = motorcades_list
+
             return AdminConfig(**parsed_values)
         except AdminConfigError:
             raise
@@ -298,7 +313,7 @@ class GoogleSheetsService:
 
     def read_questions(self) -> List[Question]:
         try:
-            range_name = f"'{QUESTIONS_SHEET}'!A:J"  # Расширяем диапазон
+            range_name = f"{QUESTIONS_SHEET}!A:J"  # Расширяем диапазон
             result = self._retry_request(
                 self.service.spreadsheets().values().get,
                 spreadsheetId=self.sheet_id,
@@ -362,7 +377,7 @@ class GoogleSheetsService:
 
     def get_last_test_time(self, telegram_id: int) -> Optional[float]:
         try:
-            range_name = f"'{RESULTS_SHEET}'!A:C"
+            range_name = f"{RESULTS_SHEET}!A:C"
             result = self._retry_request(
                 self.service.spreadsheets().values().get,
                 spreadsheetId=self.sheet_id,
@@ -396,7 +411,7 @@ class GoogleSheetsService:
             body = {'values': values}
 
             # Находим правильный диапазон, включая новые колонки
-            range_to_append = f"'{RESULTS_SHEET}'!A:I" # A-I, 9 колонок
+            range_to_append = f"{RESULTS_SHEET}!A:I" # A-I, 9 колонок
 
             append_result = self._retry_request(
                 self.service.spreadsheets().values().append,
@@ -460,7 +475,7 @@ class GoogleSheetsService:
             List of CampaignStats objects
         """
         try:
-            range_name = f"'{RESULTS_SHEET}'!A:I"
+            range_name = f"{RESULTS_SHEET}!A:I"
             result = self._retry_request(
                 self.service.spreadsheets().values().get,
                 spreadsheetId=self.sheet_id,

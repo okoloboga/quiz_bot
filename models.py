@@ -35,6 +35,7 @@ class AdminConfig:
     max_errors: int  # M
     retry_hours: int  # H
     seconds_per_question: int  # S
+    motorcades: Optional[List[str]] = None
 
 
 @dataclass
